@@ -10,10 +10,11 @@
 #   bash -s -- insidescale-org/claude-harness
 #
 # What this does (all additive / idempotent):
-#   1. Installs prerequisites: jq, gh, node, npm (via Homebrew on macOS or apt/dnf/yum on Linux).
+#   1. Installs prerequisites: jq, gh, git, rsync, node, npm (via Homebrew on macOS or apt/dnf/yum on Linux).
 #   2. Installs Claude Code CLI: `npm i -g @anthropic-ai/claude-code`.
 #   3. Ensures you are authenticated with `gh auth login`.
 #   4. Appends `export GITHUB_TOKEN=$(gh auth token)` to your shell rc (once).
+#   4b. Prompts for a Tavily API key and appends `export TAVILY_API_KEY=...` to your shell rc (once).
 #   5. Merges the client marketplace + enabled plugins into ~/.claude/settings.json
 #      without touching any unrelated keys.
 #
@@ -101,10 +102,12 @@ ensure_tool() {
   fi
 }
 
-ensure_tool jq jq jq
-ensure_tool gh gh gh
-ensure_tool node node nodejs
-ensure_tool npm  node npm
+ensure_tool jq    jq   jq
+ensure_tool gh    gh   gh
+ensure_tool git   git  git
+ensure_tool rsync rsync rsync
+ensure_tool node  node nodejs
+ensure_tool npm   node npm
 
 # -----------------------------------------------------------------------------
 # 2) Install Claude Code CLI
@@ -145,6 +148,30 @@ else
     printf '\n%s\n' "$MARKER"
     printf 'export GITHUB_TOKEN=$(gh auth token 2>/dev/null || true)\n'
   } >> "$RC_FILE"
+fi
+
+# -----------------------------------------------------------------------------
+# 4b) Ensure TAVILY_API_KEY export in shell rc (additive, idempotent via marker)
+# -----------------------------------------------------------------------------
+# Tavily MCP is bundled with the base plugin. Prompt once; write the export
+# alongside GITHUB_TOKEN. Leave unset if the user declines — Tavily tools will
+# fail with a clear error until the env var is populated.
+TAVILY_MARKER="# Palisades-Labs claude-harness-installer: TAVILY_API_KEY"
+if grep -Fq "$TAVILY_MARKER" "$RC_FILE"; then
+  log "[ok] TAVILY_API_KEY export already present in $RC_FILE"
+else
+  printf "Enter your Tavily API key (get one at https://tavily.com, press Enter to skip): "
+  read -r TAVILY_KEY
+  if [[ -n "$TAVILY_KEY" ]]; then
+    log "Adding TAVILY_API_KEY export to $RC_FILE"
+    {
+      printf '\n%s\n' "$TAVILY_MARKER"
+      printf 'export TAVILY_API_KEY=%q\n' "$TAVILY_KEY"
+    } >> "$RC_FILE"
+  else
+    log "[warn] Skipped TAVILY_API_KEY. Tavily tools will fail until you set it."
+    log "        Add this line to $RC_FILE later: export TAVILY_API_KEY=<your-key>"
+  fi
 fi
 
 # -----------------------------------------------------------------------------
