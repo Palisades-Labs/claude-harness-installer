@@ -38,6 +38,15 @@ set -euo pipefail
 log() { printf "\033[1;34m[bootstrap]\033[0m %s\n" "$*"; }
 err() { printf "\033[1;31m[error]\033[0m %s\n" "$*" >&2; }
 
+# Wrap the entire script body in main() so that, when this is invoked via
+# `curl … | bash`, bash parses the whole script (reading every byte from the
+# pipe) BEFORE any executable line runs. Without this, child processes like
+# `brew install` inherit fd 0 from bash and end up reading from the same
+# curl pipe, consuming script bytes that bash hasn't parsed yet — which
+# silently corrupts execution mid-flight (observed: jq installs, then random
+# raw script lines splattered into brew's output, then the script exits
+# without finishing). Standard pattern used by rustup, oh-my-zsh, nvm, etc.
+main() {
 ADMIN_MODE=0
 POS_ARGS=()
 for arg in "$@"; do
@@ -285,3 +294,6 @@ if [[ "$ADMIN_MODE" -eq 1 ]]; then
   echo "  4. Inside Claude, run /generate-installer to produce your team's install command."
 fi
 echo ""
+}
+
+main "$@"
