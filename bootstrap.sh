@@ -169,20 +169,47 @@ if [[ "$ADMIN_MODE" -eq 1 ]]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 1b) Ensure github.com SSH host key is in known_hosts.
+# 1b) GitHub auth path setup for Claude's plugin marketplace cloner.
 # -----------------------------------------------------------------------------
-# Claude Code's plugin marketplace cloner uses SSH for `source: "github"`
-# entries. A fresh Mac that's never connected to github.com via SSH has no
-# cached host key, so the clone fails with "Host key verification failed"
-# and the marketplace silently fails to load (no plugins, no skills). This
-# block primes known_hosts on first install; idempotent — skips if the
-# entry is already present.
+# Two complementary fixes:
+#
+#   (i) Force git to rewrite SSH github URLs to HTTPS via insteadOf. Claude
+#       Code's marketplace cloner passes SSH-form URLs (git@github.com:org/repo)
+#       to git, which would normally require an SSH key on the user's GitHub
+#       account — neither admins nor employees have one. The rewrite makes git
+#       transparently swap in the HTTPS form, which authenticates via our
+#       existing credential setup (gh helper in admin mode; GITHUB_TOKEN env
+#       var via inline helper in employee mode below).
+#
+#   (ii) ssh-keyscan github.com into known_hosts as defense in depth, so any
+#        future SSH operation (e.g., a user manually cloning, a different
+#        Claude Code build that doesn't honor insteadOf) doesn't fail on
+#        first-time host-key verification. Idempotent.
+#
+# Without (i), the marketplace clone fails with "Permission denied (publickey)"
+# even after host-key verification passes. Without (ii), defense in depth lost.
+
+# (i) Force HTTPS for github.com — idempotent (replaces same value).
+git config --global url."https://github.com/".insteadOf "git@github.com:" >/dev/null
+
+# Credential helper: in admin mode, `gh auth setup-git` (run by gh auth login)
+# already registered gh as the github.com credential helper. In employee mode,
+# there's no gh — wire up a tiny inline helper that returns x-access-token +
+# the env-var GITHUB_TOKEN so the rewritten HTTPS clone authenticates cleanly.
+if [[ "$ADMIN_MODE" -eq 0 ]]; then
+  log "Configuring git credential helper to use \$GITHUB_TOKEN (employee mode)"
+  git config --global credential.helper \
+    '!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "$GITHUB_TOKEN"; }; f' \
+    >/dev/null
+fi
+
+# (ii) ssh-keyscan github.com into known_hosts as defense in depth.
 mkdir -p "$HOME/.ssh"
 chmod 700 "$HOME/.ssh"
 touch "$HOME/.ssh/known_hosts"
 chmod 600 "$HOME/.ssh/known_hosts"
 if ! ssh-keygen -F github.com -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1; then
-  log "Adding github.com to ~/.ssh/known_hosts (needed for plugin marketplace clone)"
+  log "Adding github.com to ~/.ssh/known_hosts (defense in depth)"
   ssh-keyscan -H github.com 2>/dev/null >> "$HOME/.ssh/known_hosts"
 fi
 
