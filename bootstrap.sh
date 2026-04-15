@@ -40,10 +40,17 @@ MARKETPLACE_NAME="${REPO_NAME%-claude-harness}"
 log "Client repo:       $CLIENT_REPO"
 log "Marketplace name:  $MARKETPLACE_NAME"
 
-# When piped from curl, stdin is the script — reclaim the TTY so interactive
-# commands like `gh auth login` can prompt the user.
-if [[ ! -t 0 ]] && [[ -r /dev/tty ]]; then
-  exec < /dev/tty
+# When piped via `curl | bash`, bash reads this script FROM stdin. Replacing
+# stdin with /dev/tty (`exec < /dev/tty`) breaks that — bash stops reading the
+# remainder of the script and starts waiting for terminal input instead.
+#
+# Instead, put /dev/tty on fd 3 so interactive commands below can read from it
+# via `<&3` while bash's stdin stays pointed at the pipe.
+if [[ -r /dev/tty ]]; then
+  exec 3</dev/tty
+else
+  # No TTY available (rare: CI, cron) — fall back to current stdin.
+  exec 3<&0
 fi
 
 OS="$(uname -s)"
@@ -126,7 +133,7 @@ if gh auth status &>/dev/null; then
   log "[ok] gh already authenticated"
 else
   log "Launching 'gh auth login'. Recommended: github.com -> HTTPS -> Login with a web browser."
-  gh auth login
+  gh auth login <&3
 fi
 
 # -----------------------------------------------------------------------------
@@ -161,7 +168,7 @@ if grep -Fq "$TAVILY_MARKER" "$RC_FILE"; then
   log "[ok] TAVILY_API_KEY export already present in $RC_FILE"
 else
   printf "Enter your Tavily API key (get one at https://tavily.com, press Enter to skip): "
-  read -r TAVILY_KEY
+  read -r TAVILY_KEY <&3
   if [[ -n "$TAVILY_KEY" ]]; then
     log "Adding TAVILY_API_KEY export to $RC_FILE"
     {
