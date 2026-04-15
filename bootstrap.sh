@@ -190,6 +190,7 @@ fi
 # even after host-key verification passes. Without (ii), defense in depth lost.
 
 # (i) Force HTTPS for github.com — idempotent (replaces same value).
+log "Configuring git URL rewrite (SSH github URLs → HTTPS so Claude marketplace clones use our HTTPS auth)"
 git config --global url."https://github.com/".insteadOf "git@github.com:" >/dev/null
 
 # Credential helper: in admin mode, `gh auth setup-git` (run by gh auth login)
