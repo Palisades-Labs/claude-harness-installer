@@ -6,16 +6,18 @@
 #   Employee (default) — zero personal GitHub account setup. The installer
 #     expects $GITHUB_TOKEN to already be set in the environment (a
 #     fine-grained read-only PAT baked into the command your admin sent you).
+#     If the admin also baked in $TAVILY_API_KEY, that gets persisted too.
 #     Never calls `gh auth`. Never prompts for anything.
 #
-#     GITHUB_TOKEN=<baked-pat> curl -fsSL \
+#     GITHUB_TOKEN=<baked-pat> [TAVILY_API_KEY=<baked-tavily>] curl -fsSL \
 #       https://raw.githubusercontent.com/Palisades-Labs/claude-harness-installer/main/bootstrap.sh \
 #       | bash -s -- <org>/<repo>
 #
 #   Admin (--admin) — interactive setup for consultant and client-admin
-#     machines. Drives `gh auth login --web`, prompts for a Tavily API key,
-#     and derives GITHUB_TOKEN from `gh auth token` (the invoker's own
-#     full-scope token; safe only on admin's own machine).
+#     machines. Drives `gh auth login --web`, prompts for a Tavily API key
+#     (unless one is already in the env), and derives GITHUB_TOKEN from
+#     `gh auth token` (the invoker's own full-scope token; safe only on
+#     admin's own machine).
 #
 #     bash ~/repos/claude-harness-installer/bootstrap.sh --admin <org>/<repo>
 #
@@ -23,12 +25,14 @@
 #   1. Installs prerequisites: jq, git, rsync, node, npm (+ gh in admin mode).
 #   2. Installs Claude Code CLI: `npm i -g @anthropic-ai/claude-code`.
 #   3. Appends `export GITHUB_TOKEN=…` to your shell rc (once).
-#   4. Merges the client marketplace + enabled plugins into ~/.claude/settings.json
-#      without touching any unrelated keys.
+#   4. If $TAVILY_API_KEY is set in the env, persists it to shell rc (once).
+#      Else, in admin mode only, prompts for one.
+#   5. Merges the client marketplace + enabled plugins into ~/.claude/settings.json
+#      without touching any unrelated keys. Migrates legacy "base@<mp>" entries
+#      to "tools@<mp>" if present from a pre-rename install.
 #
 # Admin mode additionally:
-#   5. Ensures `gh auth login` (streamlined web flow).
-#   6. Prompts for a Tavily API key and appends `export TAVILY_API_KEY=...`.
+#   6. Ensures `gh auth login` (streamlined web flow).
 #
 # Does NOT: overwrite existing Claude settings, touch other marketplaces, or install
 # anything system-wide beyond what's listed above.
@@ -286,30 +290,41 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 4b) Ensure TAVILY_API_KEY export in shell rc (admin mode only)
+# 4b) Ensure TAVILY_API_KEY export in shell rc
 # -----------------------------------------------------------------------------
-# Tavily MCP is bundled with the base plugin but only admins (who run research
-# workflows) need a key. Employees' Tavily tools will fail with a clear error
-# if they ever try to use them — acceptable tradeoff for the zero-prompt flow.
-if [[ "$ADMIN_MODE" -eq 1 ]]; then
-  TAVILY_MARKER="# Palisades-Labs claude-harness-installer: TAVILY_API_KEY"
-  if grep -Fq "$TAVILY_MARKER" "$RC_FILE"; then
-    log "[ok] TAVILY_API_KEY export already present in $RC_FILE"
+# Tavily MCP is bundled with the tools plugin. Three cases:
+#   (1) $TAVILY_API_KEY already in env (employee: baked into install one-liner
+#       by the admin via /generate-installer; admin: pre-exported in their
+#       shell). Persist the literal value to rc, no prompt.
+#   (2) Admin mode without env var. Prompt interactively.
+#   (3) Employee mode without env var. Skip silently — admin chose not to
+#       bake one in. Tavily tools will fail with a clear error if used.
+TAVILY_MARKER="# Palisades-Labs claude-harness-installer: TAVILY_API_KEY"
+if grep -Fq "$TAVILY_MARKER" "$RC_FILE"; then
+  log "[ok] TAVILY_API_KEY export already present in $RC_FILE"
+elif [[ -n "${TAVILY_API_KEY:-}" ]]; then
+  # Case 1: env var present, persist literal value to rc.
+  log "Adding TAVILY_API_KEY export to $RC_FILE (from env)"
+  {
+    printf '\n%s\n' "$TAVILY_MARKER"
+    printf 'export TAVILY_API_KEY=%q\n' "$TAVILY_API_KEY"
+  } >> "$RC_FILE"
+elif [[ "$ADMIN_MODE" -eq 1 ]]; then
+  # Case 2: admin mode, no env var — prompt.
+  printf "Enter your Tavily API key (get one at https://tavily.com, press Enter to skip): "
+  read -r TAVILY_KEY <&3
+  if [[ -n "$TAVILY_KEY" ]]; then
+    log "Adding TAVILY_API_KEY export to $RC_FILE"
+    {
+      printf '\n%s\n' "$TAVILY_MARKER"
+      printf 'export TAVILY_API_KEY=%q\n' "$TAVILY_KEY"
+    } >> "$RC_FILE"
   else
-    printf "Enter your Tavily API key (get one at https://tavily.com, press Enter to skip): "
-    read -r TAVILY_KEY <&3
-    if [[ -n "$TAVILY_KEY" ]]; then
-      log "Adding TAVILY_API_KEY export to $RC_FILE"
-      {
-        printf '\n%s\n' "$TAVILY_MARKER"
-        printf 'export TAVILY_API_KEY=%q\n' "$TAVILY_KEY"
-      } >> "$RC_FILE"
-    else
-      log "[warn] Skipped TAVILY_API_KEY. Tavily tools will fail until you set it."
-      log "        Add this line to $RC_FILE later: export TAVILY_API_KEY=<your-key>"
-    fi
+    log "[warn] Skipped TAVILY_API_KEY. Tavily tools will fail until you set it."
+    log "        Add this line to $RC_FILE later: export TAVILY_API_KEY=<your-key>"
   fi
 fi
+# Case 3: employee mode + no env var — fall through silently.
 
 # -----------------------------------------------------------------------------
 # 5) Additive merge into ~/.claude/settings.json
@@ -333,7 +348,8 @@ jq --arg mp "$MARKETPLACE_NAME" --arg repo "$CLIENT_REPO" '
     .extraKnownMarketplaces //= {}
   | .extraKnownMarketplaces[$mp] = { source: { source: "github", repo: $repo } }
   | .enabledPlugins //= {}
-  | .enabledPlugins["base@\($mp)"] = true
+  | del(.enabledPlugins["base@\($mp)"])
+  | .enabledPlugins["tools@\($mp)"] = true
   | .enabledPlugins["\($mp)@\($mp)"] = true
 ' "$SETTINGS" > "$TMP"
 
