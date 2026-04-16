@@ -246,6 +246,26 @@ case "$(basename "${SHELL:-}")" in
 esac
 touch "$RC_FILE"
 
+# On macOS, Terminal.app opens bash as a LOGIN shell, which sources
+# .bash_profile but NOT .bashrc. So exports written to .bashrc never load
+# in new terminal tabs and any GUI-launched tool (like Claude Code) inherits
+# an env without GITHUB_TOKEN / TAVILY_API_KEY. Fix: ensure .bash_profile
+# sources .bashrc. Idempotent — skips if already wired up.
+if [[ "$OS" == "Darwin" ]] && [[ "$(basename "${SHELL:-}")" == "bash" ]]; then
+  PROFILE="$HOME/.bash_profile"
+  touch "$PROFILE"
+  PROFILE_MARKER="# Palisades-Labs claude-harness-installer: source .bashrc on login"
+  if grep -Fq "$PROFILE_MARKER" "$PROFILE"; then
+    log "[ok] ~/.bash_profile already sources ~/.bashrc"
+  else
+    log "Ensuring ~/.bash_profile sources ~/.bashrc (macOS bash login-shell quirk)"
+    {
+      printf '\n%s\n' "$PROFILE_MARKER"
+      printf '[ -r ~/.bashrc ] && source ~/.bashrc\n'
+    } >> "$PROFILE"
+  fi
+fi
+
 MARKER="# Palisades-Labs claude-harness-installer: GITHUB_TOKEN"
 if grep -Fq "$MARKER" "$RC_FILE"; then
   log "[ok] GITHUB_TOKEN export already present in $RC_FILE"
