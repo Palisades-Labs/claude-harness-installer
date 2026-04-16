@@ -98,10 +98,18 @@ log "Marketplace name:  $MARKETPLACE_NAME"
 #
 # Instead, put /dev/tty on fd 3 so interactive commands below can read from it
 # via `<&3` while bash's stdin stays pointed at the pipe.
-if [[ -r /dev/tty ]]; then
+#
+# The `[[ -r /dev/tty ]]` test is INSUFFICIENT: under non-interactive SSH (no
+# pty allocated), /dev/tty exists as a filesystem entry with mode 0666 and
+# `[[ -r ]]` returns true, but the actual open() fails with "Device not
+# configured" because the process has no controlling terminal. With `set -e`,
+# the failed redirect kills the script. So we test by attempting the open in
+# a subshell — the subshell's fd 3 dies with it, leaving the parent's fd 3
+# untouched until the real exec below.
+if (exec 3</dev/tty) 2>/dev/null; then
   exec 3</dev/tty
 else
-  # No TTY available (rare: CI, cron) — fall back to current stdin.
+  # No TTY available (non-interactive SSH, CI, cron) — fall back to current stdin.
   exec 3<&0
 fi
 
