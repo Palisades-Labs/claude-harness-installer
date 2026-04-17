@@ -174,6 +174,7 @@ ensure_tool git   git  git
 ensure_tool rsync rsync rsync
 ensure_tool node  node nodejs
 ensure_tool npm   node npm
+ensure_tool age   age  age
 # gh is only needed in admin mode (interactive gh auth + `gh auth token`).
 # Employees never invoke gh, so we skip this install on their machines.
 if [[ "$ADMIN_MODE" -eq 1 ]]; then
@@ -298,41 +299,63 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 4b) Ensure TAVILY_API_KEY export in shell rc
+# 4b) Collect setup passphrase, store in Keychain / file, decrypt credentials
 # -----------------------------------------------------------------------------
-# Tavily MCP is bundled with the tools plugin. Three cases:
-#   (1) $TAVILY_API_KEY already in env (employee: baked into install one-liner
-#       by the admin via /generate-installer; admin: pre-exported in their
-#       shell). Persist the literal value to rc, no prompt.
-#   (2) Admin mode without env var. Prompt interactively.
-#   (3) Employee mode without env var. Skip silently — admin chose not to
-#       bake one in. Tavily tools will fail with a clear error if used.
-TAVILY_MARKER="# Palisades-Labs claude-harness-installer: TAVILY_API_KEY"
-if grep -Fq "$TAVILY_MARKER" "$RC_FILE"; then
-  log "[ok] TAVILY_API_KEY export already present in $RC_FILE"
-elif [[ -n "${TAVILY_API_KEY:-}" ]]; then
-  # Case 1: env var present, persist literal value to rc.
-  log "Adding TAVILY_API_KEY export to $RC_FILE (from env)"
-  {
-    printf '\n%s\n' "$TAVILY_MARKER"
-    printf 'export TAVILY_API_KEY=%q\n' "$TAVILY_API_KEY"
-  } >> "$RC_FILE"
-elif [[ "$ADMIN_MODE" -eq 1 ]]; then
-  # Case 2: admin mode, no env var — prompt.
-  printf "Enter your Tavily API key (get one at https://tavily.com, press Enter to skip): "
-  read -r TAVILY_KEY <&3
-  if [[ -n "$TAVILY_KEY" ]]; then
-    log "Adding TAVILY_API_KEY export to $RC_FILE"
-    {
-      printf '\n%s\n' "$TAVILY_MARKER"
-      printf 'export TAVILY_API_KEY=%q\n' "$TAVILY_KEY"
-    } >> "$RC_FILE"
+CREDS_DIR="$HOME/.claude/credentials"
+
+log "You will be prompted for the setup passphrase your admin sent you separately."
+printf "[bootstrap] Setup passphrase: "
+read -rs HARNESS_PASSPHRASE <&3
+echo ""
+if [[ -z "$HARNESS_PASSPHRASE" ]]; then
+  log "[warn] No passphrase entered — credential decryption skipped. API tools won't work until re-run with passphrase."
+fi
+
+# Store passphrase securely (never in a shell rc file)
+if [[ -n "$HARNESS_PASSPHRASE" ]]; then
+  if [[ "$OS" == "Darwin" ]]; then
+    security delete-generic-password -a "$USER" -s "palisades-labs-harness" &>/dev/null || true
+    security add-generic-password -a "$USER" -s "palisades-labs-harness" -w "$HARNESS_PASSPHRASE"
+    log "[ok] Passphrase stored in macOS Keychain (palisades-labs-harness)"
   else
-    log "[warn] Skipped TAVILY_API_KEY. Tavily tools will fail until you set it."
-    log "        Add this line to $RC_FILE later: export TAVILY_API_KEY=<your-key>"
+    mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
+    printf '%s' "$HARNESS_PASSPHRASE" > "$CREDS_DIR/.passphrase"
+    chmod 600 "$CREDS_DIR/.passphrase"
+    log "[ok] Passphrase stored at ~/.claude/credentials/.passphrase (chmod 600)"
   fi
 fi
-# Case 3: employee mode + no env var — fall through silently.
+
+# Clone client repo and decrypt credentials.env.age
+mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
+if [[ -n "$HARNESS_PASSPHRASE" ]]; then
+  TMP_CLONE=$(mktemp -d)
+  trap 'rm -rf "$TMP_CLONE"' EXIT
+  if git clone --depth 1 --quiet \
+    "https://x-access-token:${GITHUB_TOKEN}@github.com/${CLIENT_REPO}.git" \
+    "$TMP_CLONE/repo" 2>/dev/null && \
+    [[ -f "$TMP_CLONE/repo/credentials.env.age" ]]; then
+    printf '%s\n' "$HARNESS_PASSPHRASE" | \
+      age --decrypt -o "$CREDS_DIR/credentials.env" "$TMP_CLONE/repo/credentials.env.age"
+    chmod 600 "$CREDS_DIR/credentials.env"
+    log "[ok] Credentials decrypted to ~/.claude/credentials/credentials.env"
+  else
+    log "[warn] credentials.env.age not found in repo — API keys not set up yet. Admin must run /manage-credentials first."
+  fi
+fi
+
+# Source stanza in rc file — API keys load from credentials.env, not from individual exports
+CREDS_MARKER="# Palisades-Labs claude-harness-installer: credentials source"
+if grep -Fq "$CREDS_MARKER" "$RC_FILE"; then
+  log "[ok] Credentials source stanza already present in $RC_FILE"
+else
+  {
+    printf '\n%s\n' "$CREDS_MARKER"
+    printf 'if [ -f "$HOME/.claude/credentials/credentials.env" ]; then\n'
+    printf '  set -a; source "$HOME/.claude/credentials/credentials.env"; set +a\n'
+    printf 'fi\n'
+  } >> "$RC_FILE"
+  log "[ok] Added credentials source stanza to $RC_FILE"
+fi
 
 # -----------------------------------------------------------------------------
 # 5) Additive merge into ~/.claude/settings.json
@@ -359,6 +382,14 @@ jq --arg mp "$MARKETPLACE_NAME" --arg repo "$CLIENT_REPO" '
   | del(.enabledPlugins["base@\($mp)"])
   | .enabledPlugins["tools@\($mp)"] = true
   | .enabledPlugins["\($mp)@\($mp)"] = true
+  | .permissions //= {}
+  | .permissions.deny //= []
+  | .permissions.deny |= (. + [
+      "Read(.env*)",
+      "Read(~/.claude/credentials/**)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)"
+    ] | unique)
 ' "$SETTINGS" > "$TMP"
 
 # Only replace if content changed, to keep the idempotent-rerun signal clean.

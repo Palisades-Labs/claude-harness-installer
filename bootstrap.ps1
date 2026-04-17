@@ -125,6 +125,7 @@ Ensure-Tool -Command node  -WingetId 'OpenJS.NodeJS.LTS'  -ChocoId 'nodejs-lts' 
 Ensure-Tool -Command jq    -WingetId 'jqlang.jq'          -ChocoId 'jq'         -ManualUrl 'https://jqlang.github.io/jq/download/'
 # rsync is not on winget by default; choco's `rsync` package covers it.
 Ensure-Tool -Command rsync -WingetId ''                   -ChocoId 'rsync'      -ManualUrl 'https://community.chocolatey.org/packages/rsync'
+Ensure-Tool -Command age   -WingetId 'FiloSottile.age'    -ChocoId 'age'        -ManualUrl 'https://github.com/FiloSottile/age/releases'
 if ($Admin) {
     Ensure-Tool -Command gh -WingetId 'GitHub.cli' -ChocoId 'gh' -ManualUrl 'https://cli.github.com/'
 }
@@ -185,24 +186,57 @@ if ($profileContent.Contains($tokenMarker)) {
 }
 
 # -----------------------------------------------------------------------------
-# 4b) Ensure TAVILY_API_KEY export in $PROFILE (admin mode only)
+# 4b) Collect setup passphrase, store via DPAPI, decrypt credentials
 # -----------------------------------------------------------------------------
-if ($Admin) {
-    $tavilyMarker = '# Palisades-Labs claude-harness-installer: TAVILY_API_KEY'
-    $profileContent = Get-Content $profilePath -Raw -ErrorAction SilentlyContinue
-    if ($profileContent -and $profileContent.Contains($tavilyMarker)) {
-        Log "[ok] TAVILY_API_KEY export already present in $profilePath"
-    } else {
-        $tavilyKey = Read-Host "Enter your Tavily API key (get one at https://tavily.com, press Enter to skip)"
-        if ($tavilyKey) {
-            Log "Adding TAVILY_API_KEY export to $profilePath"
-            $escaped = $tavilyKey.Replace("'", "''")
-            Add-Content -Path $profilePath -Value "`n$tavilyMarker`n`$env:TAVILY_API_KEY = '$escaped'"
+$CredsDir = Join-Path $HOME '.claude\credentials'
+
+Log "You will be prompted for the setup passphrase your admin sent you separately."
+$securePassphrase = Read-Host -Prompt "[bootstrap] Setup passphrase (from your admin, separate from install command)" -AsSecureString
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassphrase)
+$passphraseText = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+
+if (-not $passphraseText) {
+    Warn "No passphrase entered — credential decryption skipped. API tools won't work until re-run with passphrase."
+} else {
+    # Store via DPAPI — only decryptable by same user on same machine
+    $passphraseFile = Join-Path $CredsDir '.passphrase'
+    New-Item -Force -ItemType Directory $CredsDir | Out-Null
+    $encrypted = ConvertFrom-SecureString $securePassphrase
+    $encrypted | Out-File $passphraseFile
+    Log "[ok] Passphrase stored (DPAPI-protected) at $passphraseFile"
+
+    # Clone client repo and decrypt credentials
+    $credsTmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Path $credsTmp | Out-Null
+    try {
+        $cloneUrl = "https://x-access-token:$($env:GITHUB_TOKEN)@github.com/$ClientRepo.git"
+        & git clone --depth 1 --quiet $cloneUrl "$credsTmp\repo" 2>&1 | Out-Null
+        $ageFile = Join-Path $credsTmp "repo\credentials.env.age"
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $ageFile)) {
+            New-Item -Force -ItemType Directory $CredsDir | Out-Null
+            $outFile = Join-Path $CredsDir 'credentials.env'
+            $passphraseText | & age --decrypt -o $outFile $ageFile
+            Log "[ok] Credentials decrypted to ~/.claude/credentials/credentials.env"
         } else {
-            Warn "Skipped TAVILY_API_KEY. Tavily tools will fail until you set it."
-            Warn "  Add this line to $profilePath later: `$env:TAVILY_API_KEY = '<your-key>'"
+            Warn "credentials.env.age not found in repo — API keys not set up yet. Admin must run /manage-credentials first."
         }
+    } finally {
+        Remove-Item -Recurse -Force $credsTmp -ErrorAction SilentlyContinue
     }
+}
+
+# $PROFILE load stanza — API keys load from credentials.env, not individual exports
+$credsMarker = '# Palisades-Labs: credentials source'
+$profileContent = Get-Content $profilePath -Raw -ErrorAction SilentlyContinue
+if (-not $profileContent) { $profileContent = '' }
+if ($profileContent.Contains($credsMarker)) {
+    Log "[ok] Credentials source stanza already present in $profilePath"
+} else {
+    $credsFile = Join-Path $CredsDir 'credentials.env'
+    Add-Content $profilePath "`n$credsMarker"
+    Add-Content $profilePath "if (Test-Path '$credsFile') { Get-Content '$credsFile' | Where-Object { `$_ -match '^[A-Z_]+=.' } | ForEach-Object { `$k,`$v = `$_ -split '=',2; Set-Item `"env:`$k`" `$v } }"
+    Log "[ok] Added credentials source stanza to $profilePath"
 }
 
 # -----------------------------------------------------------------------------
@@ -233,8 +267,19 @@ $settings.extraKnownMarketplaces | Add-Member -NotePropertyName $MarketplaceName
 if (-not $settings.PSObject.Properties['enabledPlugins']) {
     $settings | Add-Member -NotePropertyName enabledPlugins -NotePropertyValue ([pscustomobject]@{}) -Force
 }
-$settings.enabledPlugins | Add-Member -NotePropertyName "base@$MarketplaceName"              -NotePropertyValue $true -Force
-$settings.enabledPlugins | Add-Member -NotePropertyName "$MarketplaceName@$MarketplaceName"  -NotePropertyValue $true -Force
+$settings.enabledPlugins.PSObject.Properties.Remove("base@$MarketplaceName")
+$settings.enabledPlugins | Add-Member -NotePropertyName "tools@$MarketplaceName"            -NotePropertyValue $true -Force
+$settings.enabledPlugins | Add-Member -NotePropertyName "$MarketplaceName@$MarketplaceName" -NotePropertyValue $true -Force
+
+# Deny rules for credential paths
+if (-not $settings.PSObject.Properties['permissions']) {
+    $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force
+}
+if (-not $settings.permissions.PSObject.Properties['deny']) {
+    $settings.permissions | Add-Member -NotePropertyName deny -NotePropertyValue @() -Force
+}
+$denyRules = @("Read(.env*)", "Read(~/.claude/credentials/**)", "Read(~/.ssh/**)", "Read(~/.aws/**)")
+$settings.permissions.deny = ($settings.permissions.deny + $denyRules | Sort-Object -Unique)
 
 $afterJson = ($settings | ConvertTo-Json -Depth 100 -Compress)
 if ($beforeJson -eq $afterJson) {
