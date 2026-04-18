@@ -26,7 +26,7 @@ Both serve two audiences via a mode flag:
 
 ## Passphrase lifecycle
 
-1. **Consultant or admin generates** via `/manage-credentials` in the master or client repo. Skill encrypts `credentials.env.age` with `age --encrypt --passphrase`, pushes to the client's harness repo, prints the passphrase to the operator.
+1. **Admin generates** via `/tools:manage-credentials` on their own machine (after admin bootstrap). Skill encrypts `credentials.env.age` with `age --encrypt --passphrase`, pushes to the client's harness repo, prints the passphrase for distribution. (Consultant may run it from the master repo for demos, drills, or emergency rotations — not the canonical path.)
 2. **Admin distributes** to employees out-of-band (Slack DM, 1Password share, in-person) — never in the install command itself. `/generate-installer` emits a separate passphrase block explicitly labeled for separate distribution.
 3. **Bootstrap prompts** the employee once via `read -rs` (bash) / `Read-Host -AsSecureString` (PowerShell). Input lands on fd 3 (tty), not stdin.
 4. **Bootstrap stores** the passphrase:
