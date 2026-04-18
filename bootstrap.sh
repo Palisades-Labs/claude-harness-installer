@@ -305,7 +305,12 @@ CREDS_DIR="$HOME/.claude/credentials"
 
 log "You will be prompted for the setup passphrase your admin sent you separately."
 printf "[bootstrap] Setup passphrase: "
-read -rs HARNESS_PASSPHRASE <&3
+# read can fail under non-interactive invocation (e.g. ssh without a pty) when
+# fd 3 fell back to a closed stdin at the top-of-script probe — EOF makes
+# `read` exit non-zero, which `set -e` would otherwise escalate into a script
+# death mid-install. Treat read failure the same as an empty passphrase so the
+# "No passphrase entered" warn branch below handles it uniformly.
+read -rs HARNESS_PASSPHRASE <&3 || HARNESS_PASSPHRASE=""
 echo ""
 if [[ -z "$HARNESS_PASSPHRASE" ]]; then
   log "[warn] No passphrase entered — credential decryption skipped. API tools won't work until re-run with passphrase."

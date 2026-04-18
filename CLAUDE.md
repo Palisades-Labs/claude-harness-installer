@@ -61,6 +61,7 @@ Running bootstrap twice in a row must print `[ok]` / `already present` lines for
 | macOS Terminal.app launches bash as a *login* shell, which sources `.bash_profile` but not `.bashrc` | bash | `1aacd2b` wires `.bash_profile` to source `.bashrc`. Without it, baked env vars never load in new terminals. |
 | Claude Code <2.1.109 has plugin marketplace auth bugs | npm installer | Bootstrap currently only checks binary presence, not version. **Gap** — should probably force-upgrade when below the floor. |
 | Admin mode re-run prompts for passphrase again | bash / ps | **Gap to verify in drill** — if keychain already has the entry, re-prompting is user-hostile. |
+| Passphrase `read -rs <&3` dies under non-interactive SSH (EOF + `set -e`) | bash | `|| HARNESS_PASSPHRASE=""` absorbs EOF so the "No passphrase entered" warn path handles it. Surfaced 2026-04-18 drill when admin bootstrap was run over non-TTY SSH; script died silently (exit code masked by `| tee`) after the GITHUB_TOKEN export but before the settings merge. |
 
 ## Update procedure
 
@@ -76,12 +77,12 @@ These files must stay aligned with this repo. When you change `bootstrap.sh` / `
 
 - `~/repos/claude-harness-installer/README.md` — user-facing doc
 - `~/repos/claude-harness-master/readme-template.md` — employee-facing (rendered per client)
-- `~/repos/claude-harness-master/admin-guide-template.md` — admin-facing (not yet wired into onboard-client; see drift-note below)
+- `~/repos/claude-harness-master/admin-guide-template.md` — admin-facing (rendered per client → `ADMIN.md` via `onboard-client.sh`)
 - `~/repos/claude-harness-master/tools-template/skills/generate-installer/SKILL.md` — emits the install command; must match bootstrap arg parsing exactly
 - `~/.claude/skills/onboard-client/` — derives the same marketplace name from `<org>/<repo>` as bootstrap does (strip `-claude-harness` suffix)
 
 ## Drift notes (open gaps flagged 2026-04-18)
 
-- **`admin-guide-template.md` is not rendered anywhere.** It exists in `claude-harness-master/` but `onboard-client.sh` only renders `readme-template.md` → client repo `README.md`. The admin guide is dead content. Either wire it into onboard-client (render as `ADMIN.md` in the client repo) or delete it.
 - **Version floor not enforced.** Bootstrap checks `command -v claude` but not `claude --version`. A machine with 2.1.92 installed passes the check silently and then fails marketplace auth inside Claude. Consider `npm install -g @anthropic-ai/claude-code@latest` unconditionally, or a version comparison.
 - **Windows PowerShell drill missing.** The 2026-04-18 drill covers only macOS; `bootstrap.ps1` changes (`2dcc8ca`, `efa7422`) are untested end-to-end. Track as TODO until a Windows machine is available.
+- **Existing clients don't get new template additions.** `onboard-client.sh` skips template render when scaffold already exists (by design — resume is safe). New additions like ADMIN.md (wired 2026-04-18) reach only newly-onboarded clients. Backfill is manual until a generic mechanism exists.
