@@ -247,6 +247,12 @@ if [[ "$ADMIN_MODE" -eq 1 ]]; then
     log "Launching 'gh auth login' (github.com, HTTPS, web browser)..."
     gh auth login --hostname github.com --git-protocol https --web <&3
   fi
+  # Expose the token to THIS bootstrap run so the credentials.env.age clone
+  # below can authenticate. Future shells get GITHUB_TOKEN via the rc export
+  # written in section 4; this line handles the current-process need so the
+  # first admin bootstrap (or any re-run in a shell that hasn't picked up the
+  # rc export yet) doesn't hit `GITHUB_TOKEN: unbound variable` under set -u.
+  export GITHUB_TOKEN="$(gh auth token)"
 fi
 
 # -----------------------------------------------------------------------------
