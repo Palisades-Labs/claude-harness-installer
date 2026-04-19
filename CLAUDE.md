@@ -62,6 +62,7 @@ Running bootstrap twice in a row must print `[ok]` / `already present` lines for
 | Claude Code <2.1.109 has plugin marketplace auth bugs | npm installer | Bootstrap currently only checks binary presence, not version. **Gap** — should probably force-upgrade when below the floor. |
 | Admin mode re-run prompts for passphrase again | bash / ps | **Gap to verify in drill** — if keychain already has the entry, re-prompting is user-hostile. |
 | Passphrase `read -rs <&3` dies under non-interactive SSH (EOF + `set -e`) | bash | `|| HARNESS_PASSPHRASE=""` absorbs EOF so the "No passphrase entered" warn path handles it. Surfaced 2026-04-18 drill when admin bootstrap was run over non-TTY SSH; script died silently (exit code masked by `| tee`) after the GITHUB_TOKEN export but before the settings merge. |
+| `security add-generic-password` fails with "User interaction is not allowed" under non-GUI session, killing the decrypt step | bash (macOS only) | Wrap in `if ... 2>/dev/null; then ok; else warn; fi`. Keychain storage is a re-run convenience, not a requirement — its failure must not abort the install. Re-runs re-prompt for passphrase when keychain unavailable. Surfaced 2026-04-18 during B.2b SSH-driven re-run on Felino. |
 
 ## Update procedure
 

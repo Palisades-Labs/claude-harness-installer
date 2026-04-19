@@ -320,8 +320,15 @@ fi
 if [[ -n "$HARNESS_PASSPHRASE" ]]; then
   if [[ "$OS" == "Darwin" ]]; then
     security delete-generic-password -a "$USER" -s "palisades-labs-harness" &>/dev/null || true
-    security add-generic-password -a "$USER" -s "palisades-labs-harness" -w "$HARNESS_PASSPHRASE"
-    log "[ok] Passphrase stored in macOS Keychain (palisades-labs-harness)"
+    # Keychain storage is a convenience for re-run ergonomics, not a requirement.
+    # It fails with "User interaction is not allowed" when the invoking session
+    # can't talk to the security agent (headless SSH, non-GUI admin sessions).
+    # Don't let that kill the decrypt step below.
+    if security add-generic-password -a "$USER" -s "palisades-labs-harness" -w "$HARNESS_PASSPHRASE" 2>/dev/null; then
+      log "[ok] Passphrase stored in macOS Keychain (palisades-labs-harness)"
+    else
+      log "[warn] Could not store passphrase in Keychain (likely non-GUI session). Re-runs will re-prompt."
+    fi
   else
     mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
     printf '%s' "$HARNESS_PASSPHRASE" > "$CREDS_DIR/.passphrase"
