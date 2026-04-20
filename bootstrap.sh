@@ -1,41 +1,30 @@
 #!/usr/bin/env bash
-# Palisades-Labs Claude Code harness bootstrap.
+# Palisades-Labs Claude Code harness bootstrap (decrypt-only).
 #
-# Two modes:
+# Decrypts the client's age-encrypted credentials file (shipped via Claude
+# Desktop marketplace sync) into ~/.claude/credentials/credentials.env so
+# skills that need API keys (Tavily, Avoma, etc.) can read them at runtime.
 #
-#   Employee (default) — zero personal GitHub account setup. The installer
-#     expects $GITHUB_TOKEN to already be set in the environment (a
-#     fine-grained read-only PAT baked into the command your admin sent you).
-#     If the admin also baked in $TAVILY_API_KEY, that gets persisted too.
-#     Never calls `gh auth`. Never prompts for anything.
+# Usage:
+#     bash <(curl -fsSL https://raw.githubusercontent.com/Palisades-Labs/claude-harness-installer/main/bootstrap.sh) --decrypt <org>/<repo>
 #
-#     GITHUB_TOKEN=<baked-pat> [TAVILY_API_KEY=<baked-tavily>] curl -fsSL \
-#       https://raw.githubusercontent.com/Palisades-Labs/claude-harness-installer/main/bootstrap.sh \
-#       | bash -s -- <org>/<repo>
+# Prereq: the client marketplace must already be added + synced in Claude
+# Desktop. Bootstrap reads credentials.env.age from
+#     ~/.claude/plugins/marketplaces/<marketplace-name>/credentials.env.age
+# where marketplace_name = basename(repo) with any "-claude-harness" suffix stripped.
+# If that file is missing, bootstrap errors with "marketplace not synced yet".
 #
-#   Admin (--admin) — interactive setup for consultant and client-admin
-#     machines. Drives `gh auth login --web`, prompts for a Tavily API key
-#     (unless one is already in the env), and derives GITHUB_TOKEN from
-#     `gh auth token` (the invoker's own full-scope token; safe only on
-#     admin's own machine).
+# What this does (idempotent):
+#   1. Verifies `age` is installed.
+#   2. Derives marketplace_name from <org>/<repo>.
+#   3. Confirms the marketplace sync directory + credentials.env.age exist.
+#   4. Prompts for the setup passphrase your admin sent you separately.
+#   5. Stores passphrase in macOS Keychain / Linux ~/.claude/credentials/.passphrase (chmod 600).
+#   6. Decrypts to ~/.claude/credentials/credentials.env (chmod 600).
+#   7. Adds a one-time source stanza to your shell rc so new terminals pick up the keys.
 #
-#     bash ~/repos/claude-harness-installer/bootstrap.sh --admin <org>/<repo>
-#
-# What this does (both modes, additive / idempotent):
-#   1. Installs prerequisites: jq, git, rsync, node, npm (+ gh in admin mode).
-#   2. Installs Claude Code CLI: `npm i -g @anthropic-ai/claude-code`.
-#   3. Appends `export GITHUB_TOKEN=…` to your shell rc (once).
-#   4. If $TAVILY_API_KEY is set in the env, persists it to shell rc (once).
-#      Else, in admin mode only, prompts for one.
-#   5. Merges the client marketplace + enabled plugins into ~/.claude/settings.json
-#      without touching any unrelated keys. Migrates legacy "base@<mp>" entries
-#      to "tools@<mp>" if present from a pre-rename install.
-#
-# Admin mode additionally:
-#   6. Ensures `gh auth login` (streamlined web flow).
-#
-# Does NOT: overwrite existing Claude settings, touch other marketplaces, or install
-# anything system-wide beyond what's listed above.
+# Does NOT: install Claude Code, fetch PATs, merge settings.json, or register
+# the marketplace. Those are handled by Claude Desktop / separate installer paths.
 
 set -euo pipefail
 
@@ -44,38 +33,32 @@ err() { printf "\033[1;31m[error]\033[0m %s\n" "$*" >&2; }
 
 # Wrap the entire script body in main() so that, when this is invoked via
 # `curl … | bash`, bash parses the whole script (reading every byte from the
-# pipe) BEFORE any executable line runs. Without this, child processes like
-# `brew install` inherit fd 0 from bash and end up reading from the same
-# curl pipe, consuming script bytes that bash hasn't parsed yet — which
-# silently corrupts execution mid-flight (observed: jq installs, then random
-# raw script lines splattered into brew's output, then the script exits
-# without finishing). Standard pattern used by rustup, oh-my-zsh, nvm, etc.
+# pipe) BEFORE any executable line runs. Standard pattern used by rustup,
+# oh-my-zsh, nvm, etc.
 main() {
-ADMIN_MODE=0
+DECRYPT_MODE=0
 POS_ARGS=()
 for arg in "$@"; do
   case "$arg" in
-    --admin) ADMIN_MODE=1 ;;
+    --decrypt) DECRYPT_MODE=1 ;;
     -h|--help)
-      err "Usage: bootstrap.sh [--admin] <org>/<repo>"
+      cat <<'USAGE'
+Usage: bootstrap.sh --decrypt <org>/<repo>
+
+Decrypts credentials.env.age from the synced Claude Desktop marketplace
+directory and writes ~/.claude/credentials/credentials.env (chmod 600).
+
+Prereq: marketplace must be added and synced in Claude Desktop first.
+USAGE
       exit 0 ;;
     *) POS_ARGS+=("$arg") ;;
   esac
 done
 
 CLIENT_REPO="${POS_ARGS[0]:-}"
-if [[ -z "$CLIENT_REPO" || "$CLIENT_REPO" != */* ]]; then
-  err "Usage: bootstrap.sh [--admin] <org>/<repo>  (e.g. Palisades-Labs/insidescale-claude-harness)"
-  exit 1
-fi
-
-# Employee mode (default) never touches gh — the PAT must be pre-set.
-# Admin mode will derive GITHUB_TOKEN from `gh auth token` later, so the
-# env var is not required here.
-if [[ "$ADMIN_MODE" -eq 0 && -z "${GITHUB_TOKEN:-}" ]]; then
-  err "GITHUB_TOKEN is not set."
-  err "If you didn't see an install command from your admin, ask them to send you one — it embeds the token you need."
-  err "(If you are a consultant or client admin setting up your own machine, re-run with --admin to enable interactive setup.)"
+if [[ "$DECRYPT_MODE" -ne 1 || -z "$CLIENT_REPO" || "$CLIENT_REPO" != */* ]]; then
+  err "Usage: bootstrap.sh --decrypt <org>/<repo>  (e.g. Palisades-Labs/insidescale-claude-harness)"
+  err "Prereq: add + sync the client marketplace in Claude Desktop before running."
   exit 1
 fi
 
@@ -84,13 +67,16 @@ REPO_NAME="${CLIENT_REPO##*/}"
 # This must match the marketplace 'name' field generated by /onboard-client.
 MARKETPLACE_NAME="${REPO_NAME%-claude-harness}"
 
-if [[ "$ADMIN_MODE" -eq 1 ]]; then
-  log "Mode:              ADMIN (interactive)"
-else
-  log "Mode:              employee"
-fi
 log "Client repo:       $CLIENT_REPO"
 log "Marketplace name:  $MARKETPLACE_NAME"
+
+# `age` is the only external dependency in the decrypt-only flow. Fail loud
+# on missing — decrypt is user-interactive, so a cryptic error deep in the
+# script is worse than a clear prereq-missing message up front.
+if ! command -v age &>/dev/null; then
+  err "age is not installed. Install it via 'brew install age' (macOS) or your package manager (Linux), then re-run."
+  exit 1
+fi
 
 # When piped via `curl | bash`, bash reads this script FROM stdin. Replacing
 # stdin with /dev/tty (`exec < /dev/tty`) breaks that — bash stops reading the
@@ -116,147 +102,7 @@ fi
 OS="$(uname -s)"
 
 # -----------------------------------------------------------------------------
-# 1) Install prerequisites (jq, git, rsync, node, npm; + gh in admin mode)
-# -----------------------------------------------------------------------------
-ensure_homebrew() {
-  if ! command -v brew &>/dev/null; then
-    log "Installing Homebrew..."
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    # Add brew to PATH for this shell (Apple Silicon and Intel paths)
-    if [[ -x /opt/homebrew/bin/brew ]]; then
-      eval "$(/opt/homebrew/bin/brew shellenv)"
-    elif [[ -x /usr/local/bin/brew ]]; then
-      eval "$(/usr/local/bin/brew shellenv)"
-    fi
-  fi
-}
-
-install_pkg_macos() {
-  ensure_homebrew
-  brew install "$1"
-}
-
-install_pkg_linux() {
-  if command -v apt-get &>/dev/null; then
-    sudo apt-get update -qq
-    sudo apt-get install -y "$1"
-  elif command -v dnf &>/dev/null; then
-    sudo dnf install -y "$1"
-  elif command -v yum &>/dev/null; then
-    sudo yum install -y "$1"
-  else
-    err "Unsupported Linux distro: no apt/dnf/yum found"
-    exit 1
-  fi
-}
-
-install_pkg() {
-  case "$OS" in
-    Darwin) install_pkg_macos "$1" ;;
-    Linux)  install_pkg_linux  "$1" ;;
-    *) err "Unsupported OS: $OS"; exit 1 ;;
-  esac
-}
-
-ensure_tool() {
-  local bin="$1" pkg_darwin="$2" pkg_linux="$3"
-  if command -v "$bin" &>/dev/null; then
-    log "[ok] $bin present"
-  else
-    log "Installing $bin..."
-    if [[ "$OS" == "Darwin" ]]; then install_pkg "$pkg_darwin"
-    else install_pkg "$pkg_linux"; fi
-  fi
-}
-
-ensure_tool jq    jq   jq
-ensure_tool git   git  git
-ensure_tool rsync rsync rsync
-ensure_tool node  node nodejs
-ensure_tool npm   node npm
-ensure_tool age   age  age
-# gh is only needed in admin mode (interactive gh auth + `gh auth token`).
-# Employees never invoke gh, so we skip this install on their machines.
-if [[ "$ADMIN_MODE" -eq 1 ]]; then
-  ensure_tool gh gh gh
-fi
-
-# -----------------------------------------------------------------------------
-# 1b) GitHub auth path setup for Claude's plugin marketplace cloner.
-# -----------------------------------------------------------------------------
-# Two complementary fixes:
-#
-#   (i) Force git to rewrite SSH github URLs to HTTPS via insteadOf. Claude
-#       Code's marketplace cloner passes SSH-form URLs (git@github.com:org/repo)
-#       to git, which would normally require an SSH key on the user's GitHub
-#       account — neither admins nor employees have one. The rewrite makes git
-#       transparently swap in the HTTPS form, which authenticates via our
-#       existing credential setup (gh helper in admin mode; GITHUB_TOKEN env
-#       var via inline helper in employee mode below).
-#
-#   (ii) ssh-keyscan github.com into known_hosts as defense in depth, so any
-#        future SSH operation (e.g., a user manually cloning, a different
-#        Claude Code build that doesn't honor insteadOf) doesn't fail on
-#        first-time host-key verification. Idempotent.
-#
-# Without (i), the marketplace clone fails with "Permission denied (publickey)"
-# even after host-key verification passes. Without (ii), defense in depth lost.
-
-# (i) Force HTTPS for github.com — idempotent (replaces same value).
-log "Configuring git URL rewrite (SSH github URLs → HTTPS so Claude marketplace clones use our HTTPS auth)"
-git config --global url."https://github.com/".insteadOf "git@github.com:" >/dev/null
-
-# Credential helper: in admin mode, `gh auth setup-git` (run by gh auth login)
-# already registered gh as the github.com credential helper. In employee mode,
-# there's no gh — wire up a tiny inline helper that returns x-access-token +
-# the env-var GITHUB_TOKEN so the rewritten HTTPS clone authenticates cleanly.
-if [[ "$ADMIN_MODE" -eq 0 ]]; then
-  log "Configuring git credential helper to use \$GITHUB_TOKEN (employee mode)"
-  git config --global credential.helper \
-    '!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "$GITHUB_TOKEN"; }; f' \
-    >/dev/null
-fi
-
-# (ii) ssh-keyscan github.com into known_hosts as defense in depth.
-mkdir -p "$HOME/.ssh"
-chmod 700 "$HOME/.ssh"
-touch "$HOME/.ssh/known_hosts"
-chmod 600 "$HOME/.ssh/known_hosts"
-if ! ssh-keygen -F github.com -f "$HOME/.ssh/known_hosts" >/dev/null 2>&1; then
-  log "Adding github.com to ~/.ssh/known_hosts (defense in depth)"
-  ssh-keyscan -H github.com 2>/dev/null >> "$HOME/.ssh/known_hosts"
-fi
-
-# -----------------------------------------------------------------------------
-# 2) Install Claude Code CLI
-# -----------------------------------------------------------------------------
-if command -v claude &>/dev/null; then
-  log "[ok] claude present ($(claude --version 2>/dev/null || echo unknown))"
-else
-  log "Installing Claude Code CLI (npm i -g @anthropic-ai/claude-code)..."
-  npm install -g @anthropic-ai/claude-code
-fi
-
-# -----------------------------------------------------------------------------
-# 3) Ensure gh auth (admin mode only)
-# -----------------------------------------------------------------------------
-if [[ "$ADMIN_MODE" -eq 1 ]]; then
-  if gh auth status &>/dev/null; then
-    log "[ok] gh already authenticated"
-  else
-    log "Launching 'gh auth login' (github.com, HTTPS, web browser)..."
-    gh auth login --hostname github.com --git-protocol https --web <&3
-  fi
-  # Expose the token to THIS bootstrap run so the credentials.env.age clone
-  # below can authenticate. Future shells get GITHUB_TOKEN via the rc export
-  # written in section 4; this line handles the current-process need so the
-  # first admin bootstrap (or any re-run in a shell that hasn't picked up the
-  # rc export yet) doesn't hit `GITHUB_TOKEN: unbound variable` under set -u.
-  export GITHUB_TOKEN="$(gh auth token)"
-fi
-
-# -----------------------------------------------------------------------------
-# 4) Ensure GITHUB_TOKEN export in shell rc (additive, idempotent via marker)
+# Shell rc derivation (needed for the credentials source stanza)
 # -----------------------------------------------------------------------------
 case "$(basename "${SHELL:-}")" in
   zsh)  RC_FILE="$HOME/.zshrc" ;;
@@ -268,8 +114,8 @@ touch "$RC_FILE"
 # On macOS, Terminal.app opens bash as a LOGIN shell, which sources
 # .bash_profile but NOT .bashrc. So exports written to .bashrc never load
 # in new terminal tabs and any GUI-launched tool (like Claude Code) inherits
-# an env without GITHUB_TOKEN / TAVILY_API_KEY. Fix: ensure .bash_profile
-# sources .bashrc. Idempotent — skips if already wired up.
+# an env without the credentials. Fix: ensure .bash_profile sources .bashrc.
+# Idempotent — skips if already wired up.
 if [[ "$OS" == "Darwin" ]] && [[ "$(basename "${SHELL:-}")" == "bash" ]]; then
   PROFILE="$HOME/.bash_profile"
   touch "$PROFILE"
@@ -285,29 +131,20 @@ if [[ "$OS" == "Darwin" ]] && [[ "$(basename "${SHELL:-}")" == "bash" ]]; then
   fi
 fi
 
-MARKER="# Palisades-Labs claude-harness-installer: GITHUB_TOKEN"
-if grep -Fq "$MARKER" "$RC_FILE"; then
-  log "[ok] GITHUB_TOKEN export already present in $RC_FILE"
-else
-  log "Adding GITHUB_TOKEN export to $RC_FILE"
-  {
-    printf '\n%s\n' "$MARKER"
-    if [[ "$ADMIN_MODE" -eq 1 ]]; then
-      # Admin: derive from gh auth. The `|| true` keeps new shells from erroring
-      # if gh is temporarily unavailable.
-      printf 'export GITHUB_TOKEN=$(gh auth token 2>/dev/null || true)\n'
-    else
-      # Employee: bake the pre-set token literal so it survives new shells.
-      # %q produces a shell-safe quoted form.
-      printf 'export GITHUB_TOKEN=%q\n' "$GITHUB_TOKEN"
-    fi
-  } >> "$RC_FILE"
-fi
-
 # -----------------------------------------------------------------------------
-# 4b) Collect setup passphrase, store in Keychain / file, decrypt credentials
+# Collect setup passphrase, store in Keychain / file, decrypt credentials
 # -----------------------------------------------------------------------------
 CREDS_DIR="$HOME/.claude/credentials"
+mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
+
+# Verify the age-encrypted credentials file exists in the Desktop-synced
+# marketplace directory BEFORE prompting for the passphrase. No point asking
+# for a secret if the input file is missing.
+AGE_FILE="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials.env.age"
+if [[ ! -f "$AGE_FILE" ]]; then
+  err "credentials.env.age not found at ~/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials.env.age — marketplace not synced yet. Add it in Claude Desktop and wait for sync before re-running."
+  exit 1
+fi
 
 log "You will be prompted for the setup passphrase your admin sent you separately."
 printf "[bootstrap] Setup passphrase: "
@@ -320,10 +157,8 @@ read -rs HARNESS_PASSPHRASE <&3 || HARNESS_PASSPHRASE=""
 echo ""
 if [[ -z "$HARNESS_PASSPHRASE" ]]; then
   log "[warn] No passphrase entered — credential decryption skipped. API tools won't work until re-run with passphrase."
-fi
-
-# Store passphrase securely (never in a shell rc file)
-if [[ -n "$HARNESS_PASSPHRASE" ]]; then
+else
+  # Store passphrase securely (never in a shell rc file)
   if [[ "$OS" == "Darwin" ]]; then
     security delete-generic-password -a "$USER" -s "palisades-labs-harness" &>/dev/null || true
     # Keychain storage is a convenience for re-run ergonomics, not a requirement.
@@ -336,29 +171,16 @@ if [[ -n "$HARNESS_PASSPHRASE" ]]; then
       log "[warn] Could not store passphrase in Keychain (likely non-GUI session). Re-runs will re-prompt."
     fi
   else
-    mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
     printf '%s' "$HARNESS_PASSPHRASE" > "$CREDS_DIR/.passphrase"
     chmod 600 "$CREDS_DIR/.passphrase"
     log "[ok] Passphrase stored at ~/.claude/credentials/.passphrase (chmod 600)"
   fi
-fi
 
-# Clone client repo and decrypt credentials.env.age
-mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
-if [[ -n "$HARNESS_PASSPHRASE" ]]; then
-  TMP_CLONE=$(mktemp -d)
-  trap 'rm -rf "$TMP_CLONE"' EXIT
-  if git clone --depth 1 --quiet \
-    "https://x-access-token:${GITHUB_TOKEN}@github.com/${CLIENT_REPO}.git" \
-    "$TMP_CLONE/repo" 2>/dev/null && \
-    [[ -f "$TMP_CLONE/repo/credentials.env.age" ]]; then
-    printf '%s\n' "$HARNESS_PASSPHRASE" | \
-      age --decrypt -o "$CREDS_DIR/credentials.env" "$TMP_CLONE/repo/credentials.env.age"
-    chmod 600 "$CREDS_DIR/credentials.env"
-    log "[ok] Credentials decrypted to ~/.claude/credentials/credentials.env"
-  else
-    log "[warn] credentials.env.age not found in repo — API keys not set up yet. Admin must run /manage-credentials first."
-  fi
+  # Decrypt the Desktop-synced credentials.env.age directly (no clone).
+  printf '%s\n' "$HARNESS_PASSPHRASE" | \
+    age --decrypt -o "$CREDS_DIR/credentials.env" "$AGE_FILE"
+  chmod 600 "$CREDS_DIR/credentials.env"
+  log "[ok] Credentials decrypted to ~/.claude/credentials/credentials.env"
 fi
 
 # Source stanza in rc file — API keys load from credentials.env, not from individual exports
@@ -376,62 +198,13 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 5) Additive merge into ~/.claude/settings.json
-# -----------------------------------------------------------------------------
-SETTINGS_DIR="$HOME/.claude"
-SETTINGS="$SETTINGS_DIR/settings.json"
-mkdir -p "$SETTINGS_DIR"
-
-if [[ ! -f "$SETTINGS" ]]; then
-  echo '{}' > "$SETTINGS"
-  log "Created empty $SETTINGS"
-fi
-
-if ! jq empty "$SETTINGS" 2>/dev/null; then
-  err "$SETTINGS is not valid JSON. Refusing to modify. Fix it first, then re-run."
-  exit 1
-fi
-
-TMP="$(mktemp)"
-jq --arg mp "$MARKETPLACE_NAME" --arg repo "$CLIENT_REPO" '
-    .extraKnownMarketplaces //= {}
-  | .extraKnownMarketplaces[$mp] = { source: { source: "github", repo: $repo } }
-  | .enabledPlugins //= {}
-  | del(.enabledPlugins["base@\($mp)"])
-  | .enabledPlugins["tools@\($mp)"] = true
-  | .enabledPlugins["\($mp)@\($mp)"] = true
-  | .permissions //= {}
-  | .permissions.deny //= []
-  | .permissions.deny |= (. + [
-      "Read(.env*)",
-      "Read(~/.claude/credentials/**)",
-      "Read(~/.ssh/**)",
-      "Read(~/.aws/**)"
-    ] | unique)
-' "$SETTINGS" > "$TMP"
-
-# Only replace if content changed, to keep the idempotent-rerun signal clean.
-if cmp -s "$TMP" "$SETTINGS"; then
-  rm -f "$TMP"
-  log "[ok] settings.json already has the right marketplace + plugins"
-else
-  mv "$TMP" "$SETTINGS"
-  log "[ok] settings.json updated (additive merge)"
-fi
-
-# -----------------------------------------------------------------------------
-# 6) Done
+# Done
 # -----------------------------------------------------------------------------
 echo ""
 log "Bootstrap complete."
 echo ""
 echo "Next steps:"
-echo "  1. Open a NEW terminal so GITHUB_TOKEN gets picked up."
-echo "  2. Run: claude"
-echo "  3. Inside Claude, check: /plugin list"
-if [[ "$ADMIN_MODE" -eq 1 ]]; then
-  echo "  4. Inside Claude, run /generate-installer to produce your team's install command."
-fi
+echo "  1. Open a new terminal and run: claude"
 echo ""
 }
 
