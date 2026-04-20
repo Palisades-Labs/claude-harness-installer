@@ -96,7 +96,15 @@ if (-not (Test-Path -LiteralPath $CredsDir)) {
 }
 
 Log "You will be prompted for the setup passphrase your admin sent you separately."
-$securePassphrase = Read-Host -Prompt "[bootstrap] Setup passphrase (from your admin, separate from install command)" -AsSecureString
+try {
+    $securePassphrase = Read-Host -Prompt "[bootstrap] Setup passphrase (from your admin, separate from install command)" -AsSecureString
+} catch {
+    # Non-interactive stdin (iwr|iex through piped input, CI, etc.) — Read-Host
+    # throws instead of returning empty under $ErrorActionPreference = 'Stop'.
+    # Treat EOF as empty passphrase so the "No passphrase entered" warn branch
+    # handles it uniformly. Mirrors bootstrap.sh:156 `|| HARNESS_PASSPHRASE=""`.
+    $securePassphrase = $null
+}
 
 # Empty-passphrase test: pull length from the SecureString without extracting
 # plaintext. If the user just hit Enter, Length is 0.
@@ -115,7 +123,11 @@ if (-not $securePassphrase -or $securePassphrase.Length -eq 0) {
         New-Item -ItemType File -Path $PassphraseFile -Force | Out-Null
     }
     # Strip inherited ACEs and grant ONLY the current user Read+Write.
+    # Native exes don't elevate non-zero exits through $ErrorActionPreference —
+    # check $LASTEXITCODE explicitly so silent icacls failure doesn't leave the
+    # file with inherited ACLs before we write the secret.
     & icacls $PassphraseFile /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null
+    if ($LASTEXITCODE -ne 0) { Die "icacls failed on $PassphraseFile (exit $LASTEXITCODE)" }
 
     # DPAPI: only the same user on the same machine can decrypt. No -Key
     # parameter → default DPAPI protection.
@@ -133,6 +145,7 @@ if (-not $securePassphrase -or $securePassphrase.Length -eq 0) {
         New-Item -ItemType File -Path $CredsFile -Force | Out-Null
     }
     & icacls $CredsFile /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null
+    if ($LASTEXITCODE -ne 0) { Die "icacls failed on $CredsFile (exit $LASTEXITCODE)" }
 
     # Extract plaintext passphrase through BSTR, scrub BSTR after use.
     # The $plain .NET string is immutable so can't be zeroed — BSTR zeroing
@@ -152,6 +165,7 @@ if (-not $securePassphrase -or $securePassphrase.Length -eq 0) {
     # Re-lock ACL after age wrote the file — age may recreate via atomic
     # rename which can restore inheritance.
     & icacls $CredsFile /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null
+    if ($LASTEXITCODE -ne 0) { Die "icacls failed on $CredsFile (exit $LASTEXITCODE)" }
     Log "[ok] Credentials decrypted to ~/.claude/credentials/credentials.env"
 }
 
