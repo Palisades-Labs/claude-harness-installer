@@ -165,14 +165,15 @@ else
     # It fails with "User interaction is not allowed" when the invoking session
     # can't talk to the security agent (headless SSH, non-GUI admin sessions).
     # Don't let that kill the decrypt step below.
-    if security add-generic-password -a "$USER" -s "palisades-labs-harness" -w "$HARNESS_PASSPHRASE" 2>/dev/null; then
+    # Pipe passphrase via stdin, not argv — macOS `ps auxww` reveals argv.
+    if printf '%s' "$HARNESS_PASSPHRASE" | security add-generic-password -a "$USER" -s "palisades-labs-harness" -w 2>/dev/null; then
       log "[ok] Passphrase stored in macOS Keychain (palisades-labs-harness)"
     else
       log "[warn] Could not store passphrase in Keychain (likely non-GUI session). Re-runs will re-prompt."
     fi
   else
-    printf '%s' "$HARNESS_PASSPHRASE" > "$CREDS_DIR/.passphrase"
-    chmod 600 "$CREDS_DIR/.passphrase"
+    # Tighten umask in subshell so the file is 600 at creation — no write-then-chmod race.
+    ( umask 077 && printf '%s' "$HARNESS_PASSPHRASE" > "$CREDS_DIR/.passphrase" )
     log "[ok] Passphrase stored at ~/.claude/credentials/.passphrase (chmod 600)"
   fi
 
