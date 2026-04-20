@@ -1,6 +1,6 @@
 # CLAUDE.md — claude-harness-installer
 
-*Last Edited: 2026-04-18*
+*Last Edited: 2026-04-19*
 
 Operator notes for future Claude Code / Aaron sessions editing this repo. Not shipped to end users.
 
@@ -60,7 +60,7 @@ Running bootstrap twice in a row must print `[ok]` / `already present` lines for
 | Claude Code marketplace cloner uses SSH URLs; employees have no SSH keys on their GH accounts | both | `git config --global url."https://github.com/".insteadOf "git@github.com:"` + inline env-var credential helper in employee mode. |
 | macOS Terminal.app launches bash as a *login* shell, which sources `.bash_profile` but not `.bashrc` | bash | `1aacd2b` wires `.bash_profile` to source `.bashrc`. Without it, baked env vars never load in new terminals. |
 | Claude Code <2.1.109 has plugin marketplace auth bugs | npm installer | Bootstrap currently only checks binary presence, not version. **Gap** — should probably force-upgrade when below the floor. |
-| Admin mode re-run prompts for passphrase again | bash / ps | **Gap to verify in drill** — if keychain already has the entry, re-prompting is user-hostile. |
+| Admin mode re-run prompts for passphrase again | bash / ps | **Drill-confirmed 2026-04-19** — current code always prompts + `delete-generic-password` + re-add on every run. Fix tracked as post-drill cleanup PR: before the prompt, try `security find-generic-password -a "$USER" -s palisades-labs-harness -w` (macOS) or read `~/.claude/credentials/.passphrase` (Linux); skip the prompt on hit. Need equivalent logic in `bootstrap.ps1` for parity. Leaving gap row in place until the fix lands. |
 | Passphrase `read -rs <&3` dies under non-interactive SSH (EOF + `set -e`) | bash | `|| HARNESS_PASSPHRASE=""` absorbs EOF so the "No passphrase entered" warn path handles it. Surfaced 2026-04-18 drill when admin bootstrap was run over non-TTY SSH; script died silently (exit code masked by `| tee`) after the GITHUB_TOKEN export but before the settings merge. |
 | `security add-generic-password` fails with "User interaction is not allowed" under non-GUI session, killing the decrypt step | bash (macOS only) | Wrap in `if ... 2>/dev/null; then ok; else warn; fi`. Keychain storage is a re-run convenience, not a requirement — its failure must not abort the install. Re-runs re-prompt for passphrase when keychain unavailable. Surfaced 2026-04-18 during B.2b SSH-driven re-run on Felino. |
 | Admin-mode clone at line ~346 references `${GITHUB_TOKEN}` but nothing sets it in the current session — rc export only helps future shells | bash (admin mode only) | After gh auth check, do `export GITHUB_TOKEN="$(gh auth token)"` to populate the current bootstrap run's env. Without this, first-ever admin run dies with `GITHUB_TOKEN: unbound variable` under `set -u` the moment `credentials.env.age` exists and a passphrase is supplied (the warn-path run never reaches the clone, which is why this hid until 2026-04-18 B.2b). |
