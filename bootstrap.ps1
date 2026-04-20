@@ -1,48 +1,42 @@
-# Palisades-Labs Claude Code harness bootstrap (Windows PowerShell).
+# Palisades-Labs Claude Code harness bootstrap (decrypt-only, Windows).
 #
-# Two modes:
+# Decrypts the client's age-encrypted credentials file (shipped via Claude
+# Desktop marketplace sync) into ~/.claude/credentials/credentials.env so
+# skills that need API keys (Tavily, Avoma, etc.) can read them at runtime.
 #
-#   Employee (default) — zero personal GitHub account setup. The installer
-#     expects $env:GITHUB_TOKEN to already be set (a fine-grained read-only
-#     PAT baked into the command your admin sent you). Never calls `gh auth`.
-#     Never prompts for anything.
-#
-#     Employees never run this script directly — they paste the one-liner
-#     their admin sent them, which looks like:
-#
-#       Set-ExecutionPolicy -Scope Process Bypass -Force
-#       $env:GITHUB_TOKEN='<baked-pat>'
-#       $env:CLIENT_REPO='<org>/<repo>'
+# Usage (one-liner, via iwr|iex — set env vars first so param binding works):
+#     $env:DECRYPT_MODE='1'; $env:CLIENT_REPO='<org>/<repo>'; `
 #       iwr -useb https://raw.githubusercontent.com/Palisades-Labs/claude-harness-installer/main/bootstrap.ps1 | iex
 #
-#   Admin (-Admin) — interactive setup for consultant and client-admin
-#     machines. Drives `gh auth login --web`, prompts for a Tavily API key,
-#     and derives GITHUB_TOKEN from `gh auth token` (safe only on admin's
-#     own machine).
+# Or locally:
+#     .\bootstrap.ps1 -Decrypt -Repo <org>/<repo>
 #
-#     .\bootstrap.ps1 -Admin -ClientRepo <org>/<repo>
+# Prereq: the client marketplace must already be added + synced in Claude
+# Desktop. Bootstrap reads credentials.env.age from
+#     ~/.claude/plugins/marketplaces/<marketplace-name>/credentials.env.age
+# where marketplace_name = basename(repo) with any "-claude-harness" suffix stripped.
+# If that file is missing, bootstrap errors with "marketplace not synced yet".
 #
-# What this does (both modes, additive / idempotent):
-#   1. Installs prerequisites via winget → choco fallback: git, node, jq,
-#      rsync (+ gh in admin mode).
-#   2. Installs Claude Code CLI: `npm i -g @anthropic-ai/claude-code`.
-#   3. Appends `$env:GITHUB_TOKEN = ...` to your PowerShell $PROFILE (once).
-#   4. Merges the client marketplace + enabled plugins into
-#      %USERPROFILE%\.claude\settings.json without touching unrelated keys.
+# What this does (idempotent):
+#   1. Verifies `age` is installed.
+#   2. Derives marketplace_name from <org>/<repo>.
+#   3. Confirms the marketplace sync directory + credentials.env.age exist.
+#   4. Prompts for the setup passphrase your admin sent you separately.
+#   5. Stores passphrase DPAPI-protected at ~/.claude/credentials/.passphrase.
+#   6. Decrypts to ~/.claude/credentials/credentials.env (owner-only ACL).
+#   7. Adds a one-time source stanza to your PowerShell $PROFILE so new
+#      shells pick up the keys.
 #
-# Admin mode additionally:
-#   5. Ensures `gh auth login` (streamlined web flow).
-#   6. Prompts for a Tavily API key and appends to $PROFILE.
+# Does NOT: install Claude Code, fetch PATs, merge settings.json, or register
+# the marketplace. Those are handled by Claude Desktop / separate installer paths.
+
+#Requires -Version 5.1
 
 [CmdletBinding()]
 param(
-    [string]$ClientRepo,
-    [switch]$Admin
+    [switch]$Decrypt,
+    [string]$Repo
 )
-
-# When invoked via `iwr | iex`, param() binding is skipped — fall back to env vars.
-if (-not $ClientRepo) { $ClientRepo = $env:CLIENT_REPO }
-if (-not $Admin -and $env:ADMIN_MODE -eq '1') { $Admin = $true }
 
 $ErrorActionPreference = 'Stop'
 
@@ -51,255 +45,149 @@ function Warn { param([string]$Msg) Write-Host "[warn] $Msg"      -ForegroundCol
 function Die  { param([string]$Msg) Write-Host "[error] $Msg"     -ForegroundColor Red; exit 1 }
 
 # -----------------------------------------------------------------------------
-# 0) Validate args + mode
+# 0) Validate args
 # -----------------------------------------------------------------------------
-if (-not $ClientRepo -or $ClientRepo -notmatch '^[^/]+/[^/]+$') {
-    Die "Usage: bootstrap.ps1 [-Admin] -ClientRepo <org>/<repo>  (or set `$env:CLIENT_REPO)"
-}
+# When invoked via `iwr | iex`, param() binding is skipped — fall back to env vars.
+if (-not $Repo)    { $Repo = $env:CLIENT_REPO }
+if (-not $Decrypt -and $env:DECRYPT_MODE -eq '1') { $Decrypt = $true }
 
-# Employee mode (default) never touches gh — the PAT must be pre-set.
-if (-not $Admin -and -not $env:GITHUB_TOKEN) {
-    Write-Host "[error] GITHUB_TOKEN is not set." -ForegroundColor Red
-    Write-Host "[error] If you didn't see an install command from your admin, ask them to send you one — it embeds the token you need." -ForegroundColor Red
-    Write-Host "[error] (If you are a consultant or client admin setting up your own machine, re-run with -Admin for interactive setup.)" -ForegroundColor Red
+if (-not $Decrypt -or -not $Repo -or $Repo -notmatch '^[^/]+/[^/]+$') {
+    Write-Host "[error] Usage: bootstrap.ps1 -Decrypt -Repo <org>/<repo>  (e.g. Palisades-Labs/insidescale-claude-harness)" -ForegroundColor Red
+    Write-Host "[error] Prereq: add + sync the client marketplace in Claude Desktop before running." -ForegroundColor Red
     exit 1
 }
 
-$RepoName = $ClientRepo.Split('/')[-1]
+$RepoName = $Repo.Split('/')[-1]
 # Strip '-claude-harness' suffix if present; matches bootstrap.sh and /onboard-client.
+# This is the Option C invariant.
 $MarketplaceName = $RepoName -replace '-claude-harness$', ''
 
-if ($Admin) { Log "Mode:              ADMIN (interactive)" }
-else        { Log "Mode:              employee" }
-Log "Client repo:       $ClientRepo"
+Log "Client repo:       $Repo"
 Log "Marketplace name:  $MarketplaceName"
 
 # -----------------------------------------------------------------------------
-# 1) Install prerequisites (winget → choco fallback)
+# 1) Verify age is installed
 # -----------------------------------------------------------------------------
-# Refresh PATH after each install so later Get-Command sees the new tool.
-function Refresh-Path {
-    $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH', 'Machine') + ';' +
-                [System.Environment]::GetEnvironmentVariable('PATH', 'User')
-}
-
-function Install-Via-Winget {
-    param([string]$Id)
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { return $false }
-    Log "  winget install --id $Id --silent ..."
-    winget install --id $Id --silent --accept-package-agreements --accept-source-agreements -e | Out-Null
-    if ($LASTEXITCODE -ne 0) { return $false }
-    Refresh-Path
-    return $true
-}
-
-function Install-Via-Choco {
-    param([string]$Id)
-    if (-not (Get-Command choco -ErrorAction SilentlyContinue)) { return $false }
-    Log "  choco install $Id -y ..."
-    choco install $Id -y --no-progress | Out-Null
-    if ($LASTEXITCODE -ne 0) { return $false }
-    Refresh-Path
-    return $true
-}
-
-function Ensure-Tool {
-    param(
-        [Parameter(Mandatory)][string]$Command,
-        [string]$WingetId,
-        [string]$ChocoId,
-        [Parameter(Mandatory)][string]$ManualUrl
-    )
-    if (Get-Command $Command -ErrorAction SilentlyContinue) {
-        Log "[ok] $Command present"
-        return
-    }
-    Log "Installing $Command..."
-    if ($WingetId -and (Install-Via-Winget $WingetId)) { return }
-    if ($ChocoId  -and (Install-Via-Choco  $ChocoId )) { return }
-    Die "Could not install $Command. Neither winget nor choco is available (or the package is unavailable). Install manually: $ManualUrl"
-}
-
-Ensure-Tool -Command git   -WingetId 'Git.Git'            -ChocoId 'git'        -ManualUrl 'https://git-scm.com/download/win'
-Ensure-Tool -Command node  -WingetId 'OpenJS.NodeJS.LTS'  -ChocoId 'nodejs-lts' -ManualUrl 'https://nodejs.org/en/download'
-Ensure-Tool -Command jq    -WingetId 'jqlang.jq'          -ChocoId 'jq'         -ManualUrl 'https://jqlang.github.io/jq/download/'
-# rsync is not on winget by default; choco's `rsync` package covers it.
-Ensure-Tool -Command rsync -WingetId ''                   -ChocoId 'rsync'      -ManualUrl 'https://community.chocolatey.org/packages/rsync'
-Ensure-Tool -Command age   -WingetId 'FiloSottile.age'    -ChocoId 'age'        -ManualUrl 'https://github.com/FiloSottile/age/releases'
-if ($Admin) {
-    Ensure-Tool -Command gh -WingetId 'GitHub.cli' -ChocoId 'gh' -ManualUrl 'https://cli.github.com/'
+# `age` is the only external dependency in the decrypt-only flow. Fail loud
+# on missing — decrypt is user-interactive, so a cryptic error deep in the
+# script is worse than a clear prereq-missing message up front.
+if (-not (Get-Command age -ErrorAction SilentlyContinue)) {
+    Die "age is not installed. Install it via 'winget install FiloSottile.age' or 'choco install age', then re-run."
 }
 
 # -----------------------------------------------------------------------------
-# 2) Install Claude Code CLI
-# -----------------------------------------------------------------------------
-if (Get-Command claude -ErrorAction SilentlyContinue) {
-    $ver = (claude --version 2>$null)
-    if (-not $ver) { $ver = 'unknown' }
-    Log "[ok] claude present ($ver)"
-} else {
-    Log "Installing Claude Code CLI (npm i -g @anthropic-ai/claude-code)..."
-    npm install -g '@anthropic-ai/claude-code'
-    Refresh-Path
-}
-
-# -----------------------------------------------------------------------------
-# 3) Ensure gh auth (admin mode only)
-# -----------------------------------------------------------------------------
-if ($Admin) {
-    & gh auth status 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Log "[ok] gh already authenticated"
-    } else {
-        Log "Launching 'gh auth login' (github.com, HTTPS, web browser)..."
-        gh auth login --hostname github.com --git-protocol https --web
-    }
-}
-
-# -----------------------------------------------------------------------------
-# 4) Ensure GITHUB_TOKEN export in $PROFILE (additive, idempotent via marker)
-# -----------------------------------------------------------------------------
-$profilePath = $PROFILE
-$profileDir  = Split-Path -Parent $profilePath
-if (-not (Test-Path $profileDir)) { New-Item -ItemType Directory -Path $profileDir -Force | Out-Null }
-if (-not (Test-Path $profilePath)) { New-Item -ItemType File -Path $profilePath -Force | Out-Null }
-
-$profileContent = Get-Content $profilePath -Raw -ErrorAction SilentlyContinue
-if (-not $profileContent) { $profileContent = '' }
-
-$tokenMarker = '# Palisades-Labs claude-harness-installer: GITHUB_TOKEN'
-if ($profileContent.Contains($tokenMarker)) {
-    Log "[ok] GITHUB_TOKEN export already present in $profilePath"
-} else {
-    Log "Adding GITHUB_TOKEN export to $profilePath"
-    if ($Admin) {
-        # Admin: derive from gh auth at shell-startup time. Mirrors the bash
-        # admin flow; safe on admin's own machine.
-        $tokenLine = '$env:GITHUB_TOKEN = (gh auth token 2>$null)'
-    } else {
-        # Employee: bake the pre-set token literal. Escape single quotes
-        # defensively even though GitHub PATs don't contain them.
-        $escaped = $env:GITHUB_TOKEN.Replace("'", "''")
-        $tokenLine = "`$env:GITHUB_TOKEN = '$escaped'"
-    }
-    Add-Content -Path $profilePath -Value "`n$tokenMarker`n$tokenLine"
-}
-
-# -----------------------------------------------------------------------------
-# 4b) Collect setup passphrase, store via DPAPI, decrypt credentials
+# 2) Verify credentials.env.age exists in the Desktop-synced marketplace dir
 # -----------------------------------------------------------------------------
 $CredsDir = Join-Path $HOME '.claude\credentials'
+$AgeFile  = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName\credentials.env.age"
+
+# Check BEFORE prompting for the passphrase. No point asking for a secret if
+# the input file is missing. Error wording matches bootstrap.sh byte-for-byte
+# (with forward slashes in the path, per the bash version).
+if (-not (Test-Path -LiteralPath $AgeFile)) {
+    Die "credentials.env.age not found at ~/.claude/plugins/marketplaces/$MarketplaceName/credentials.env.age — marketplace not synced yet. Add it in Claude Desktop and wait for sync before re-running."
+}
+
+# -----------------------------------------------------------------------------
+# 3) Collect setup passphrase
+# -----------------------------------------------------------------------------
+if (-not (Test-Path -LiteralPath $CredsDir)) {
+    New-Item -ItemType Directory -Path $CredsDir -Force | Out-Null
+}
 
 Log "You will be prompted for the setup passphrase your admin sent you separately."
 $securePassphrase = Read-Host -Prompt "[bootstrap] Setup passphrase (from your admin, separate from install command)" -AsSecureString
-$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassphrase)
-$passphraseText = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
 
-if (-not $passphraseText) {
+# Empty-passphrase test: pull length from the SecureString without extracting
+# plaintext. If the user just hit Enter, Length is 0.
+if (-not $securePassphrase -or $securePassphrase.Length -eq 0) {
     Warn "No passphrase entered — credential decryption skipped. API tools won't work until re-run with passphrase."
 } else {
-    # Store via DPAPI — only decryptable by same user on same machine
-    $passphraseFile = Join-Path $CredsDir '.passphrase'
-    New-Item -Force -ItemType Directory $CredsDir | Out-Null
-    $encrypted = ConvertFrom-SecureString $securePassphrase
-    $encrypted | Out-File $passphraseFile
-    Log "[ok] Passphrase stored (DPAPI-protected) at $passphraseFile"
+    # -------------------------------------------------------------------------
+    # 4) Store passphrase DPAPI-protected (owner-only, machine-locked)
+    # -------------------------------------------------------------------------
+    $PassphraseFile = Join-Path $CredsDir '.passphrase'
 
-    # Clone client repo and decrypt credentials
-    $credsTmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
-    New-Item -ItemType Directory -Path $credsTmp | Out-Null
+    # Create the file first with tight ACL BEFORE writing secrets — no window
+    # where the file is readable by anyone but the owner. PowerShell equivalent
+    # of the bash `( umask 077 && ... )` pattern.
+    if (-not (Test-Path -LiteralPath $PassphraseFile)) {
+        New-Item -ItemType File -Path $PassphraseFile -Force | Out-Null
+    }
+    # Strip inherited ACEs and grant ONLY the current user Read+Write.
+    & icacls $PassphraseFile /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null
+
+    # DPAPI: only the same user on the same machine can decrypt. No -Key
+    # parameter → default DPAPI protection.
+    $encrypted = ConvertFrom-SecureString $securePassphrase
+    Set-Content -Path $PassphraseFile -Value $encrypted -NoNewline
+    Log "[ok] Passphrase stored (DPAPI-protected) at ~/.claude/credentials/.passphrase"
+
+    # -------------------------------------------------------------------------
+    # 5) Decrypt credentials.env.age → credentials.env
+    # -------------------------------------------------------------------------
+    $CredsFile = Join-Path $CredsDir 'credentials.env'
+
+    # Create output file with tight ACL BEFORE age writes to it.
+    if (-not (Test-Path -LiteralPath $CredsFile)) {
+        New-Item -ItemType File -Path $CredsFile -Force | Out-Null
+    }
+    & icacls $CredsFile /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null
+
+    # Extract plaintext passphrase through BSTR, scrub BSTR after use.
+    # The $plain .NET string is immutable so can't be zeroed — BSTR zeroing
+    # is the best we can do to minimize exposure.
+    # Passphrase goes to age via stdin (piped), NEVER on argv.
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePassphrase)
     try {
-        $cloneUrl = "https://x-access-token:$($env:GITHUB_TOKEN)@github.com/$ClientRepo.git"
-        & git clone --depth 1 --quiet $cloneUrl "$credsTmp\repo" 2>&1 | Out-Null
-        $ageFile = Join-Path $credsTmp "repo\credentials.env.age"
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $ageFile)) {
-            New-Item -Force -ItemType Directory $CredsDir | Out-Null
-            $outFile = Join-Path $CredsDir 'credentials.env'
-            $passphraseText | & age --decrypt -o $outFile $ageFile
-            Log "[ok] Credentials decrypted to ~/.claude/credentials/credentials.env"
-        } else {
-            Warn "credentials.env.age not found in repo — API keys not set up yet. Admin must run /manage-credentials first."
+        $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        $plain | & age --decrypt -o $CredsFile $AgeFile
+        if ($LASTEXITCODE -ne 0) {
+            Die "age --decrypt failed (exit $LASTEXITCODE). Wrong passphrase, or credentials.env.age is malformed."
         }
     } finally {
-        Remove-Item -Recurse -Force $credsTmp -ErrorAction SilentlyContinue
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     }
+
+    # Re-lock ACL after age wrote the file — age may recreate via atomic
+    # rename which can restore inheritance.
+    & icacls $CredsFile /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null
+    Log "[ok] Credentials decrypted to ~/.claude/credentials/credentials.env"
 }
 
-# $PROFILE load stanza — API keys load from credentials.env, not individual exports
-$credsMarker = '# Palisades-Labs: credentials source'
-$profileContent = Get-Content $profilePath -Raw -ErrorAction SilentlyContinue
-if (-not $profileContent) { $profileContent = '' }
-if ($profileContent.Contains($credsMarker)) {
+# -----------------------------------------------------------------------------
+# 6) Ensure $PROFILE sources credentials.env on shell start (idempotent)
+# -----------------------------------------------------------------------------
+$profilePath = $PROFILE
+$profileDir  = Split-Path -Parent $profilePath
+if (-not (Test-Path -LiteralPath $profileDir))  { New-Item -ItemType Directory -Path $profileDir  -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $profilePath)) { New-Item -ItemType File      -Path $profilePath -Force | Out-Null }
+
+$credsMarker = '# Palisades-Labs claude-harness-installer: credentials source'
+$alreadyPresent = $false
+if (Test-Path -LiteralPath $profilePath) {
+    $alreadyPresent = [bool](Select-String -LiteralPath $profilePath -SimpleMatch -Pattern $credsMarker -Quiet)
+}
+
+if ($alreadyPresent) {
     Log "[ok] Credentials source stanza already present in $profilePath"
 } else {
-    $credsFile = Join-Path $CredsDir 'credentials.env'
-    Add-Content $profilePath "`n$credsMarker"
-    Add-Content $profilePath "if (Test-Path '$credsFile') { Get-Content '$credsFile' | Where-Object { `$_ -match '^[A-Z_]+=.' } | ForEach-Object { `$k,`$v = `$_ -split '=',2; Set-Item `"env:`$k`" `$v } }"
+    $credsFilePath = Join-Path $CredsDir 'credentials.env'
+    $stanza = @"
+
+$credsMarker
+if (Test-Path '$credsFilePath') { Get-Content '$credsFilePath' | Where-Object { `$_ -match '^[A-Z_]+=.' } | ForEach-Object { `$k,`$v = `$_ -split '=',2; Set-Item "env:`$k" `$v } }
+"@
+    Add-Content -Path $profilePath -Value $stanza
     Log "[ok] Added credentials source stanza to $profilePath"
 }
 
 # -----------------------------------------------------------------------------
-# 5) Additive merge into %USERPROFILE%\.claude\settings.json
-# -----------------------------------------------------------------------------
-$settingsDir  = Join-Path $HOME '.claude'
-$settingsPath = Join-Path $settingsDir 'settings.json'
-if (-not (Test-Path $settingsDir)) { New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null }
-if (-not (Test-Path $settingsPath)) { '{}' | Set-Content -Path $settingsPath -NoNewline; Log "Created empty $settingsPath" }
-
-try {
-    $settings = Get-Content $settingsPath -Raw | ConvertFrom-Json
-} catch {
-    Die "$settingsPath is not valid JSON. Refusing to modify. Fix it first, then re-run."
-}
-
-# Snapshot current JSON for idempotent-rerun signal.
-$beforeJson = ($settings | ConvertTo-Json -Depth 100 -Compress)
-
-# Ensure extraKnownMarketplaces object exists.
-if (-not $settings.PSObject.Properties['extraKnownMarketplaces']) {
-    $settings | Add-Member -NotePropertyName extraKnownMarketplaces -NotePropertyValue ([pscustomobject]@{}) -Force
-}
-$mpSource = [pscustomobject]@{ source = [pscustomobject]@{ source = 'github'; repo = $ClientRepo } }
-$settings.extraKnownMarketplaces | Add-Member -NotePropertyName $MarketplaceName -NotePropertyValue $mpSource -Force
-
-# Ensure enabledPlugins object exists.
-if (-not $settings.PSObject.Properties['enabledPlugins']) {
-    $settings | Add-Member -NotePropertyName enabledPlugins -NotePropertyValue ([pscustomobject]@{}) -Force
-}
-$settings.enabledPlugins.PSObject.Properties.Remove("base@$MarketplaceName")
-$settings.enabledPlugins | Add-Member -NotePropertyName "tools@$MarketplaceName"            -NotePropertyValue $true -Force
-$settings.enabledPlugins | Add-Member -NotePropertyName "$MarketplaceName@$MarketplaceName" -NotePropertyValue $true -Force
-
-# Deny rules for credential paths
-if (-not $settings.PSObject.Properties['permissions']) {
-    $settings | Add-Member -NotePropertyName permissions -NotePropertyValue ([pscustomobject]@{}) -Force
-}
-if (-not $settings.permissions.PSObject.Properties['deny']) {
-    $settings.permissions | Add-Member -NotePropertyName deny -NotePropertyValue @() -Force
-}
-$denyRules = @("Read(.env*)", "Read(~/.claude/credentials/**)", "Read(~/.ssh/**)", "Read(~/.aws/**)")
-$settings.permissions.deny = ($settings.permissions.deny + $denyRules | Sort-Object -Unique)
-
-$afterJson = ($settings | ConvertTo-Json -Depth 100 -Compress)
-if ($beforeJson -eq $afterJson) {
-    Log "[ok] settings.json already has the right marketplace + plugins"
-} else {
-    ($settings | ConvertTo-Json -Depth 100) | Set-Content -Path $settingsPath
-    Log "[ok] settings.json updated (additive merge)"
-}
-
-# -----------------------------------------------------------------------------
-# 6) Done
+# 7) Done
 # -----------------------------------------------------------------------------
 Write-Host ''
 Log "Bootstrap complete."
 Write-Host ''
 Write-Host "Next steps:"
-Write-Host "  1. Open a NEW PowerShell window so `$env:GITHUB_TOKEN gets picked up."
-Write-Host "  2. Run: claude"
-Write-Host "  3. Inside Claude, check: /plugin list"
-if ($Admin) {
-    Write-Host "  4. Inside Claude, run /generate-installer to produce your team's install command."
-}
+Write-Host "  1. Open a new PowerShell window and run: claude"
 Write-Host ''
