@@ -6,85 +6,82 @@ Operator notes for future Claude Code / Aaron sessions editing this repo. Not sh
 
 ## Purpose
 
-Single-file curl|bash bootstrapper that installs the Palisades-Labs Claude Code harness on a developer's laptop. Ships from this public repo so client employees don't need read access to `claude-harness-master`. Two scripts:
+Single-file curl|bash bootstrapper that decrypts the client harness's encrypted credentials file on a developer's laptop. Ships from this public repo so client employees don't need read access to `claude-harness-master`. Two scripts:
 
 - `bootstrap.sh` — macOS + Linux
 - `bootstrap.ps1` — Windows
 
-Both serve two audiences via a mode flag:
-
-| Mode | Flag | GITHUB_TOKEN source | Who | Touches `gh` |
-|---|---|---|---|---|
-| Employee | (default) | env var, pre-baked into the install command | Client teammates | Never |
-| Admin | `--admin` / `-Admin` | `gh auth token` (after `gh auth login --web`) | Consultant + client admins | Yes |
+**Decrypt-only** (post-2026-04-15 migration). The script does NOT install Claude Code, fetch GitHub PATs, register marketplaces, or merge `settings.json`. Those are handled by Claude Desktop (marketplace add + sync) and the user's existing Claude Code install. The script's single job: take the age-encrypted `credentials/credentials.env.age` that Claude Desktop synced from the marketplace clone, prompt for the passphrase, decrypt it to `~/.claude/credentials/credentials.env`, and add a source stanza to the shell rc.
 
 ## Prereqs
 
-`bootstrap.sh` installs these if missing: `jq`, `git`, `rsync`, `node`, `npm`, `age`. Plus `gh` in admin mode. `bootstrap.ps1` does the same via `winget` → `choco` fallback.
+`bootstrap.sh` auto-installs `age` from GitHub releases to `~/.local/bin/age` if missing — no Homebrew or sudo required. The current implementation downloads the pinned version `v1.3.1` (hardcoded; `_install_age` in the script). Bumping the version is a one-line edit.
 
-`age` is load-bearing: added in commit `2dcc8ca` for credential decryption. If it's not installed, the credentials step fails silently and the harness loses access to team API keys (Tavily, etc.).
+`age` is the only external dependency in the decrypt-only flow. If the auto-install fails (network error, unsupported architecture), the script exits with a clear message pointing at https://github.com/FiloSottile/age/releases.
+
+**Known gap:** `~/.local/bin` is added to PATH only for the current bootstrap run (`export PATH=` inside the script). It is NOT added to the user's rc file, so re-runs from a fresh terminal hit "age not installed" again and re-download. Fix is queued for next bootstrap edit pass — write `export PATH="$HOME/.local/bin:$PATH"` to the rc with a marker comment, same pattern as the credentials-source stanza.
 
 ## Passphrase lifecycle
 
-1. **Admin generates** via `/tools:manage-credentials` on their own machine (after admin bootstrap). Skill encrypts `credentials.env.age` with `age --encrypt --passphrase`, pushes to the client's harness repo, prints the passphrase for distribution. (Consultant may run it from the master repo for demos, drills, or emergency rotations — not the canonical path.)
-2. **Admin distributes** to employees out-of-band (Slack DM, 1Password share, in-person) — never in the install command itself. `/generate-installer` emits a separate passphrase block explicitly labeled for separate distribution.
-3. **Bootstrap prompts** the employee once via `read -rs` (bash) / `Read-Host -AsSecureString` (PowerShell). Input lands on fd 3 (tty), not stdin.
+1. **Admin sets** the passphrase in their own password manager (1Password, Bitwarden) BEFORE invoking `/client-admin:manage-credentials`. They paste it at `age`'s native passphrase prompt; `age` confirms and encrypts. The passphrase never enters Claude's chat context.
+2. **Admin distributes** to employees out-of-band (1Password share preferred; Slack DM / in-person as fallback) — never in the same message as the install command. `/client-admin:generate-installer` defaults to placeholder mode for the passphrase block (the admin substitutes the real value in the outgoing message draft, not back into the chat).
+3. **Bootstrap prompts** the employee once via `read -rs <&3` (bash) or `Read-Host -AsSecureString` (PowerShell). Input lands on fd 3 (`/dev/tty`), not stdin (which is the curl pipe).
 4. **Bootstrap stores** the passphrase:
-   - macOS: `security add-generic-password -a $USER -s palisades-labs-harness -w <pass>` (Keychain)
-   - Linux: `~/.claude/credentials/.passphrase` chmod 600
-   - Windows: DPAPI-protected file `~/.claude/credentials/.passphrase`
-5. **Bootstrap decrypts** the repo's `credentials/credentials.env.age` → `~/.claude/credentials/credentials.env` (mode 600). Shell rc gets a `set -a; source …; set +a` stanza so future terminals load the vars.
+   - macOS: `security add-generic-password -a $USER -s palisades-labs-harness -w <pass>` (Keychain). Wraps in conditional — failure here is acceptable (non-GUI session, "User interaction is not allowed") and falls through to a "passphrase will be re-prompted on next run" warn.
+   - Linux: `~/.claude/credentials/.passphrase` chmod 600.
+   - Windows: DPAPI-protected file `~/.claude/credentials/.passphrase`.
+5. **Bootstrap decrypts** the marketplace-synced `credentials/credentials.env.age` → `~/.claude/credentials/credentials.env` (mode 600). Shell rc gets a `set -a; source …; set +a` stanza so future terminals load the vars.
 
-If `credentials/credentials.env.age` is missing from the repo, bootstrap logs a warn and proceeds. Re-running after the admin populates it picks up the creds.
+If `credentials/credentials.env.age` is missing from the marketplace clone, bootstrap fails with a clear "marketplace not synced yet" error. The fix path is in Claude Desktop (wait for sync to complete, or remove + re-add the marketplace).
 
 ## Idempotence
 
 Every mutating step is guarded:
 
-- rc-file markers (`# Palisades-Labs claude-harness-installer: GITHUB_TOKEN` and `# Palisades-Labs claude-harness-installer: credentials source`) prevent duplicate exports.
-- macOS `.bash_profile` wiring (`1aacd2b`) uses a marker comment for idempotence.
-- `settings.json` merge uses `jq` to produce the target state, then `cmp -s` to short-circuit writes when the desired state already matches. PowerShell equivalent compares pre/post JSON strings.
-- `git config --global url.X.insteadOf Y` is an overwrite-same-value no-op.
-- `ssh-keygen -F github.com` gates the `ssh-keyscan` append.
+- rc-file marker (`# Palisades-Labs claude-harness-installer: credentials source`) prevents duplicate exports.
+- macOS `.bash_profile` wiring uses a marker comment for idempotence (sources `.bashrc` from `.bash_profile` to fix the login-shell quirk).
 - Keychain entry is `security delete … || true` before `add` to preserve re-run safety.
 
-Running bootstrap twice in a row must print `[ok]` / `already present` lines for every step and leave no file modified. This is the single most important invariant — treat any diff across re-runs as a bug.
+Running bootstrap twice in a row must print `[ok]` / `already present` lines for every step and leave no file modified beyond `credentials.env` (rewritten with the freshly-decrypted contents). Treat any other diff across re-runs as a bug.
 
 ## Known issues + guards
 
 | Issue | Where | Guard |
 |---|---|---|
 | curl\|bash corrupted by child processes reading stdin mid-script | bash | Entire body wrapped in `main()` — bash parses the full file before executing. Pattern from `rustup`/`nvm`. |
-| `[[ -r /dev/tty ]]` returns true under non-interactive SSH but `open()` fails with "Device not configured" | bash | `(exec 3</dev/tty) 2>/dev/null` subshell probe (`50c22b5`). Subshell's fd 3 dies with it; parent stays clean. |
+| `[[ -r /dev/tty ]]` returns true under non-interactive SSH but `open()` fails with "Device not configured" | bash | `(exec 3</dev/tty) 2>/dev/null` subshell probe. Subshell's fd 3 dies with it; parent stays clean. |
 | `exec < /dev/tty` steals bash's stdin, halts the script when invoked as `curl | bash` | bash | Put tty on fd 3 instead; use `<&3` for interactive reads. |
-| Claude Code marketplace cloner uses SSH URLs; employees have no SSH keys on their GH accounts | both | `git config --global url."https://github.com/".insteadOf "git@github.com:"` + inline env-var credential helper in employee mode. |
-| macOS Terminal.app launches bash as a *login* shell, which sources `.bash_profile` but not `.bashrc` | bash | `1aacd2b` wires `.bash_profile` to source `.bashrc`. Without it, baked env vars never load in new terminals. |
-| Claude Code <2.1.109 has plugin marketplace auth bugs | npm installer | Bootstrap currently only checks binary presence, not version. **Gap** — should probably force-upgrade when below the floor. |
-| Admin mode re-run prompts for passphrase again | bash / ps | **Drill-confirmed 2026-04-19** — current code always prompts + `delete-generic-password` + re-add on every run. Fix tracked as post-drill cleanup PR: before the prompt, try `security find-generic-password -a "$USER" -s palisades-labs-harness -w` (macOS) or read `~/.claude/credentials/.passphrase` (Linux); skip the prompt on hit. Need equivalent logic in `bootstrap.ps1` for parity. Leaving gap row in place until the fix lands. |
-| Passphrase `read -rs <&3` dies under non-interactive SSH (EOF + `set -e`) | bash | `|| HARNESS_PASSPHRASE=""` absorbs EOF so the "No passphrase entered" warn path handles it. Surfaced 2026-04-18 drill when admin bootstrap was run over non-TTY SSH; script died silently (exit code masked by `| tee`) after the GITHUB_TOKEN export but before the settings merge. |
-| `security add-generic-password` fails with "User interaction is not allowed" under non-GUI session, killing the decrypt step | bash (macOS only) | Wrap in `if ... 2>/dev/null; then ok; else warn; fi`. Keychain storage is a re-run convenience, not a requirement — its failure must not abort the install. Re-runs re-prompt for passphrase when keychain unavailable. Surfaced 2026-04-18 during B.2b SSH-driven re-run on Felino. |
-| Admin-mode clone at line ~346 references `${GITHUB_TOKEN}` but nothing sets it in the current session — rc export only helps future shells | bash (admin mode only) | After gh auth check, do `export GITHUB_TOKEN="$(gh auth token)"` to populate the current bootstrap run's env. Without this, first-ever admin run dies with `GITHUB_TOKEN: unbound variable` under `set -u` the moment `credentials.env.age` exists and a passphrase is supplied (the warn-path run never reaches the clone, which is why this hid until 2026-04-18 B.2b). |
+| macOS Terminal.app launches bash as a *login* shell, which sources `.bash_profile` but not `.bashrc` | bash | `.bash_profile` wired to source `.bashrc`. Without it, baked env vars never load in new terminals. |
+| Passphrase `read -rs <&3` dies under non-interactive SSH (EOF + `set -e`) | bash | `\|\| HARNESS_PASSPHRASE=""` absorbs EOF so the "No passphrase entered" warn path handles it. Surfaced 2026-04-18 drill when admin bootstrap was run over non-TTY SSH. |
+| `security add-generic-password` fails with "User interaction is not allowed" under non-GUI session, killing the decrypt step | bash (macOS only) | Wrap in `if ... 2>/dev/null; then ok; else warn; fi`. Keychain storage is a re-run convenience, not a requirement. |
+| Marketplace name derivation doesn't strip `-harness` (only `-claude-harness`) | bash | **FIXED 2026-04-21** — `MARKETPLACE_NAME="${REPO_NAME%-claude-harness}"` then `MARKETPLACE_NAME="${MARKETPLACE_NAME%-harness}"` (handles both naming conventions). Bug surfaced when `test-client-harness` mapped to `test-client-harness` instead of `test-client`. |
+| `credentials.env.age` lookup at marketplace root, not in `credentials/` subdirectory | bash | **FIXED 2026-04-21** — `AGE_FILE` path now includes `credentials/` prefix to match where `manage-credentials` writes it. |
+| `age` auto-install adds to PATH for current run only, not rc file | bash | **GAP** — re-runs from fresh terminal re-download. Fix: rc-write with marker. Tracked as next-edit task. |
+| `raw.githubusercontent.com` CDN can lag 5–30+ minutes after a push | distribution | Use commit-SHA-pinned URL, or `scp` directly to test machine, or fetch via `gh api ... | base64 -d`. Documented in `~/.claude/directives/palisades-labs-harness-troubleshooting.md` § Session gotchas — 2026-04-21. |
+| Plugin cache (`~/.claude/plugins/cache/<mp>/`) is separate from marketplace clone (`~/.claude/plugins/marketplaces/<mp>/`) | client install | `claude plugin marketplace update` updates clone but NOT cache; must `rm -rf` cache after pushing skill updates. Documented in troubleshooting directive. |
 
 ## Update procedure
 
 1. Edit `bootstrap.sh` or `bootstrap.ps1` locally.
-2. Test on a sandbox machine (Felino / Laptop 2 / fresh VM). Drill both golden path and at least the wrong-passphrase edge case.
-3. Commit with a message that mentions the bug pattern the change guards against — the existing log (`50c22b5`, `95d7d71`, etc.) is a good model.
-4. Push to `main`. The next `curl` from any install command hits the new version — there's no versioning or CDN cache to flush.
-5. If the change alters the install-command interface (new required env var, new positional arg), update `tools-template/skills/generate-installer/SKILL.md` in the same PR — cross-layer invariant.
+2. Test on a sandbox machine (claude-test-1 / Felino / fresh VM). Drill both golden path and at least the wrong-passphrase edge case.
+3. Commit with a message that mentions the bug pattern the change guards against — the existing log is a good model.
+4. Push to `main`. **The CDN can take 5–30+ minutes to refresh.** During active debugging, expect to use commit-SHA-pinned URLs or `scp` the script directly until the CDN catches up.
+5. If the change alters the install-command interface (new required env var, new positional arg), update `~/repos/plugin-client-admin/skills/generate-installer/SKILL.md` in the same change — cross-layer invariant.
 
 ## Cross-layer references
 
 These files must stay aligned with this repo. When you change `bootstrap.sh` / `bootstrap.ps1` CLI surface, update these in the same change:
 
 - `~/repos/claude-harness-installer/README.md` — user-facing doc
+- `~/repos/claude-harness-installer/EMPLOYEE-GUIDE.md` — plain-English employee install guide
 - `~/repos/claude-harness-master/readme-template.md` — employee-facing (rendered per client)
 - `~/repos/claude-harness-master/admin-guide-template.md` — admin-facing (rendered per client → `ADMIN.md` via `onboard-client.sh`)
-- `~/repos/claude-harness-master/tools-template/skills/generate-installer/SKILL.md` — emits the install command; must match bootstrap arg parsing exactly
-- `~/.claude/skills/onboard-client/` — derives the same marketplace name from `<org>/<repo>` as bootstrap does (strip `-claude-harness` suffix)
+- `~/repos/plugin-client-admin/skills/generate-installer/SKILL.md` — emits the install command; must match bootstrap arg parsing exactly
+- `~/.claude/skills/onboard-client/` — derives the same marketplace name from `<org>/<repo>` as bootstrap does (strip `-claude-harness` then `-harness`)
 
-## Drift notes (open gaps flagged 2026-04-18)
+## Drift notes (open gaps)
 
-- **Version floor not enforced.** Bootstrap checks `command -v claude` but not `claude --version`. A machine with 2.1.92 installed passes the check silently and then fails marketplace auth inside Claude. Consider `npm install -g @anthropic-ai/claude-code@latest` unconditionally, or a version comparison.
-- **Windows PowerShell drill missing.** The 2026-04-18 drill covers only macOS; `bootstrap.ps1` changes (`2dcc8ca`, `efa7422`) are untested end-to-end. Track as TODO until a Windows machine is available.
-- **Existing clients don't get new template additions.** `onboard-client.sh` skips template render when scaffold already exists (by design — resume is safe). New additions like ADMIN.md (wired 2026-04-18) reach only newly-onboarded clients. Backfill is manual until a generic mechanism exists.
+- **Version floor not enforced for Claude Code itself.** Bootstrap doesn't check `claude --version`. A machine with old Claude installed silently passes; downstream errors look like marketplace auth bugs. Consider documenting "ensure Claude Code 2.1.109+" in the EMPLOYEE-GUIDE prereqs section, and let `claude doctor` surface the actual mismatch.
+- **Windows PowerShell drill incomplete.** The 2026-04-21 drill covers only macOS via `claude-test-1`. `bootstrap.ps1` changes are untested end-to-end. Track as TODO until a Windows machine is available.
+- **Existing clients don't get new template additions.** `onboard-client.sh` skips template render when scaffold already exists (by design — resume is safe). New additions like ADMIN.md reach only newly-onboarded clients. Backfill is manual until a generic mechanism exists.
+- **`~/.local/bin` PATH addition** — see "Known issues + guards" above. Re-runs from fresh terminal re-download `age`.
