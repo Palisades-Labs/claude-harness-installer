@@ -10,7 +10,7 @@
 #
 # Prereq: the client marketplace must already be added + synced in Claude
 # Desktop. Bootstrap reads credentials.env.age from
-#     ~/.claude/plugins/marketplaces/<marketplace-name>/credentials.env.age
+#     ~/.claude/plugins/marketplaces/<marketplace-name>/credentials/credentials.env.age
 # where marketplace_name = basename(repo) with any "-claude-harness" suffix stripped.
 # If that file is missing, bootstrap errors with "marketplace not synced yet".
 #
@@ -170,9 +170,9 @@ mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
 # Verify the age-encrypted credentials file exists in the Desktop-synced
 # marketplace directory BEFORE prompting for the passphrase. No point asking
 # for a secret if the input file is missing.
-AGE_FILE="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials.env.age"
+AGE_FILE="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials/credentials.env.age"
 if [[ ! -f "$AGE_FILE" ]]; then
-  err "credentials.env.age not found at ~/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials.env.age — marketplace not synced yet. Add it in Claude Desktop and wait for sync before re-running."
+  err "credentials.env.age not found at ~/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials/credentials.env.age — marketplace not synced yet. Add it in Claude Desktop and wait for sync before re-running."
   exit 1
 fi
 
