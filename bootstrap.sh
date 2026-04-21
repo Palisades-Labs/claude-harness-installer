@@ -81,9 +81,7 @@ _install_age() {
     arm64|aarch64) arch="arm64" ;;
     *) err "Unsupported architecture: $(uname -m). Install age manually: https://github.com/FiloSottile/age/releases"; exit 1 ;;
   esac
-  version="$(curl -fsSL https://api.github.com/repos/FiloSottile/age/releases/latest \
-    | grep '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
-  [[ -z "$version" ]] && { err "Could not fetch latest age version. Try: brew install age"; exit 1; }
+  version="v1.3.1"
   tmpdir="$(mktemp -d)"
   curl -fsSL "https://github.com/FiloSottile/age/releases/download/${version}/age-${version}-${os}-${arch}.tar.gz" \
     | tar -xz -C "$tmpdir"
