@@ -70,12 +70,44 @@ MARKETPLACE_NAME="${REPO_NAME%-claude-harness}"
 log "Client repo:       $CLIENT_REPO"
 log "Marketplace name:  $MARKETPLACE_NAME"
 
-# `age` is the only external dependency in the decrypt-only flow. Fail loud
-# on missing — decrypt is user-interactive, so a cryptic error deep in the
-# script is worse than a clear prereq-missing message up front.
+# `age` is the only external dependency in the decrypt-only flow. Auto-install
+# from GitHub releases if missing — no Homebrew or sudo required.
+_install_age() {
+  log "age not found — downloading from GitHub releases..."
+  local os arch version tmpdir
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "$(uname -m)" in
+    x86_64)        arch="amd64" ;;
+    arm64|aarch64) arch="arm64" ;;
+    *) err "Unsupported architecture: $(uname -m). Install age manually: https://github.com/FiloSottile/age/releases"; exit 1 ;;
+  esac
+  version="$(curl -fsSL https://api.github.com/repos/FiloSottile/age/releases/latest \
+    | grep '"tag_name"' | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
+  [[ -z "$version" ]] && { err "Could not fetch latest age version. Try: brew install age"; exit 1; }
+  tmpdir="$(mktemp -d)"
+  curl -fsSL "https://github.com/FiloSottile/age/releases/download/${version}/age-${version}-${os}-${arch}.tar.gz" \
+    | tar -xz -C "$tmpdir"
+  mkdir -p "$HOME/.local/bin"
+  mv "$tmpdir/age/age" "$HOME/.local/bin/age"
+  chmod +x "$HOME/.local/bin/age"
+  rm -rf "$tmpdir"
+  export PATH="$HOME/.local/bin:$PATH"
+  log "[ok] age ${version} installed to ~/.local/bin/age"
+}
+
+# age may exist outside PATH (e.g. /opt/homebrew/bin on Apple Silicon without
+# Homebrew shell init). Check common locations before downloading.
 if ! command -v age &>/dev/null; then
-  err "age is not installed. Install it via 'brew install age' (macOS) or your package manager (Linux), then re-run."
-  exit 1
+  for _candidate in /opt/homebrew/bin/age /usr/local/bin/age "$HOME/.local/bin/age"; do
+    if [[ -x "$_candidate" ]]; then
+      export PATH="$(dirname "$_candidate"):$PATH"
+      break
+    fi
+  done
+fi
+
+if ! command -v age &>/dev/null; then
+  _install_age
 fi
 
 # When piped via `curl | bash`, bash reads this script FROM stdin. Replacing
