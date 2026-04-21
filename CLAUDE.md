@@ -19,7 +19,7 @@ Single-file curl|bash bootstrapper that decrypts the client harness's encrypted 
 
 `age` is the only external dependency in the decrypt-only flow. If the auto-install fails (network error, unsupported architecture), the script exits with a clear message pointing at https://github.com/FiloSottile/age/releases.
 
-**Known gap:** `~/.local/bin` is added to PATH only for the current bootstrap run (`export PATH=` inside the script). It is NOT added to the user's rc file, so re-runs from a fresh terminal hit "age not installed" again and re-download. Fix is queued for next bootstrap edit pass — write `export PATH="$HOME/.local/bin:$PATH"` to the rc with a marker comment, same pattern as the credentials-source stanza.
+**Resolved 2026-04-21:** `_install_age` now also writes `export PATH="$HOME/.local/bin:$PATH"` to the user's shell rc (`.zshrc` or `.bashrc`) with marker comment `# Palisades-Labs claude-harness-installer: ~/.local/bin on PATH (for age)`. Re-runs from a fresh terminal find `age` without re-downloading. Idempotence preserved via the `grep -Fq "$path_marker"` guard.
 
 ## Passphrase lifecycle
 
@@ -56,7 +56,7 @@ Running bootstrap twice in a row must print `[ok]` / `already present` lines for
 | `security add-generic-password` fails with "User interaction is not allowed" under non-GUI session, killing the decrypt step | bash (macOS only) | Wrap in `if ... 2>/dev/null; then ok; else warn; fi`. Keychain storage is a re-run convenience, not a requirement. |
 | Marketplace name derivation doesn't strip `-harness` (only `-claude-harness`) | bash | **FIXED 2026-04-21** — `MARKETPLACE_NAME="${REPO_NAME%-claude-harness}"` then `MARKETPLACE_NAME="${MARKETPLACE_NAME%-harness}"` (handles both naming conventions). Bug surfaced when `test-client-harness` mapped to `test-client-harness` instead of `test-client`. |
 | `credentials.env.age` lookup at marketplace root, not in `credentials/` subdirectory | bash | **FIXED 2026-04-21** — `AGE_FILE` path now includes `credentials/` prefix to match where `manage-credentials` writes it. |
-| `age` auto-install adds to PATH for current run only, not rc file | bash | **GAP** — re-runs from fresh terminal re-download. Fix: rc-write with marker. Tracked as next-edit task. |
+| `age` auto-install adds to PATH for current run only, not rc file | bash | **FIXED 2026-04-21** — `_install_age` writes `export PATH="$HOME/.local/bin:$PATH"` to user's rc with marker comment. Re-runs from fresh terminal find `age` without re-downloading. |
 | `raw.githubusercontent.com` CDN can lag 5–30+ minutes after a push | distribution | Use commit-SHA-pinned URL, or `scp` directly to test machine, or fetch via `gh api ... | base64 -d`. Documented in `~/.claude/directives/palisades-labs-harness-troubleshooting.md` § Session gotchas — 2026-04-21. |
 | Plugin cache (`~/.claude/plugins/cache/<mp>/`) is separate from marketplace clone (`~/.claude/plugins/marketplaces/<mp>/`) | client install | `claude plugin marketplace update` updates clone but NOT cache; must `rm -rf` cache after pushing skill updates. Documented in troubleshooting directive. |
 
@@ -84,4 +84,3 @@ These files must stay aligned with this repo. When you change `bootstrap.sh` / `
 - **Version floor not enforced for Claude Code itself.** Bootstrap doesn't check `claude --version`. A machine with old Claude installed silently passes; downstream errors look like marketplace auth bugs. Consider documenting "ensure Claude Code 2.1.109+" in the EMPLOYEE-GUIDE prereqs section, and let `claude doctor` surface the actual mismatch.
 - **Windows PowerShell drill incomplete.** The 2026-04-21 drill covers only macOS via `claude-test-1`. `bootstrap.ps1` changes are untested end-to-end. Track as TODO until a Windows machine is available.
 - **Existing clients don't get new template additions.** `onboard-client.sh` skips template render when scaffold already exists (by design — resume is safe). New additions like ADMIN.md reach only newly-onboarded clients. Backfill is manual until a generic mechanism exists.
-- **`~/.local/bin` PATH addition** — see "Known issues + guards" above. Re-runs from fresh terminal re-download `age`.

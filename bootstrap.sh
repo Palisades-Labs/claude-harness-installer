@@ -92,6 +92,25 @@ _install_age() {
   rm -rf "$tmpdir"
   export PATH="$HOME/.local/bin:$PATH"
   log "[ok] age ${version} installed to ~/.local/bin/age"
+
+  # Persist ~/.local/bin to PATH in the user's rc file so future terminals
+  # (including bootstrap re-runs) find age without re-downloading. Marker
+  # comment guards idempotence — re-runs of bootstrap won't duplicate the line.
+  local rc_file
+  case "$(basename "${SHELL:-}")" in
+    zsh)  rc_file="$HOME/.zshrc" ;;
+    bash) rc_file="$HOME/.bashrc" ;;
+    *)    rc_file="$( [[ "$(uname -s)" == "Darwin" ]] && echo "$HOME/.zshrc" || echo "$HOME/.bashrc" )" ;;
+  esac
+  touch "$rc_file"
+  local path_marker="# Palisades-Labs claude-harness-installer: ~/.local/bin on PATH (for age)"
+  if ! grep -Fq "$path_marker" "$rc_file"; then
+    {
+      printf '\n%s\n' "$path_marker"
+      printf 'export PATH="$HOME/.local/bin:$PATH"\n'
+    } >> "$rc_file"
+    log "[ok] Added ~/.local/bin to PATH in $rc_file"
+  fi
 }
 
 # age may exist outside PATH (e.g. /opt/homebrew/bin on Apple Silicon without
