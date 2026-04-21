@@ -1,6 +1,6 @@
 # CLAUDE.md — claude-harness-installer
 
-*Last Edited: 2026-04-19*
+*Last Edited: 2026-04-21*
 
 Operator notes for future Claude Code / Aaron sessions editing this repo. Not shipped to end users.
 
@@ -33,9 +33,9 @@ Both serve two audiences via a mode flag:
    - macOS: `security add-generic-password -a $USER -s palisades-labs-harness -w <pass>` (Keychain)
    - Linux: `~/.claude/credentials/.passphrase` chmod 600
    - Windows: DPAPI-protected file `~/.claude/credentials/.passphrase`
-5. **Bootstrap decrypts** the repo's `credentials.env.age` → `~/.claude/credentials/credentials.env` (mode 600). Shell rc gets a `set -a; source …; set +a` stanza so future terminals load the vars.
+5. **Bootstrap decrypts** the repo's `credentials/credentials.env.age` → `~/.claude/credentials/credentials.env` (mode 600). Shell rc gets a `set -a; source …; set +a` stanza so future terminals load the vars.
 
-If `credentials.env.age` is missing from the repo, bootstrap logs a warn and proceeds. Re-running after the admin populates it picks up the creds.
+If `credentials/credentials.env.age` is missing from the repo, bootstrap logs a warn and proceeds. Re-running after the admin populates it picks up the creds.
 
 ## Idempotence
 
