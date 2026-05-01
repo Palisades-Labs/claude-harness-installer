@@ -197,7 +197,51 @@ if (Test-Path '$credsFilePath') { Get-Content '$credsFilePath' | Where-Object { 
 }
 
 # -----------------------------------------------------------------------------
-# 7) Done
+# 7) Inject harness orientation into ~/.claude/CLAUDE.md
+# -----------------------------------------------------------------------------
+# Claude Code auto-loads ~/.claude/CLAUDE.md in every session. Splice the
+# harness's home-claude.md (shipped at the marketplace root) between
+# marketplace-scoped markers so multiple harnesses can coexist and re-runs
+# idempotently update the block without touching the user's own content.
+$HomeClaudeSrc = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName\home-claude.md"
+$HomeClaudeDst = Join-Path $HOME '.claude\CLAUDE.md'
+$BeginMarker = "<!-- claude-harness orientation: $MarketplaceName (begin) -->"
+$EndMarker   = "<!-- claude-harness orientation: $MarketplaceName (end) -->"
+
+if (Test-Path -LiteralPath $HomeClaudeSrc) {
+    $dstDir = Split-Path -Parent $HomeClaudeDst
+    if (-not (Test-Path -LiteralPath $dstDir))  { New-Item -ItemType Directory -Path $dstDir  -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $HomeClaudeDst)) { New-Item -ItemType File -Path $HomeClaudeDst -Force | Out-Null }
+
+    $existing = Get-Content -LiteralPath $HomeClaudeDst -Raw -ErrorAction SilentlyContinue
+    if ($null -eq $existing) { $existing = '' }
+    $orientation = Get-Content -LiteralPath $HomeClaudeSrc -Raw
+
+    if ($existing -match [regex]::Escape($BeginMarker)) {
+        # Existing block — replace content between markers in-place. Use a
+        # MatchEvaluator so $-substitutions (e.g. dollar signs in the orientation
+        # content) are passed through literally.
+        $pattern = [regex]::Escape($BeginMarker) + '[\s\S]*?' + [regex]::Escape($EndMarker)
+        $replacement = "$BeginMarker`n$orientation$EndMarker"
+        $evaluator = [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $replacement }
+        $updated = [regex]::Replace($existing, $pattern, $evaluator)
+        # Set-Content rewrites atomically on Windows (temp + rename).
+        Set-Content -LiteralPath $HomeClaudeDst -Value $updated -NoNewline
+        Log "[ok] Updated $MarketplaceName orientation block in ~/.claude/CLAUDE.md"
+    } else {
+        # First install — append a new block, preserving any existing content.
+        $sep = ''
+        if ($existing.Length -gt 0 -and -not $existing.EndsWith("`n")) { $sep = "`n" }
+        $block = "$sep`n$BeginMarker`n$orientation$EndMarker`n"
+        Add-Content -LiteralPath $HomeClaudeDst -Value $block -NoNewline
+        Log "[ok] Added $MarketplaceName orientation block to ~/.claude/CLAUDE.md"
+    }
+} else {
+    Log "[info] No home-claude.md in this marketplace — skipping ~/.claude/CLAUDE.md injection."
+}
+
+# -----------------------------------------------------------------------------
+# 8) Done
 # -----------------------------------------------------------------------------
 Write-Host ''
 Log "Bootstrap complete."
