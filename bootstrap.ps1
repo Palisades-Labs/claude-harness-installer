@@ -200,10 +200,10 @@ if (Test-Path '$credsFilePath') { Get-Content '$credsFilePath' | Where-Object { 
 # 7) Inject harness orientation into ~/.claude/CLAUDE.md
 # -----------------------------------------------------------------------------
 # Claude Code auto-loads ~/.claude/CLAUDE.md in every session. Splice the
-# harness's home-claude.md (shipped at the marketplace root) between
+# harness's CLAUDE.md (shipped at the marketplace root) between
 # marketplace-scoped markers so multiple harnesses can coexist and re-runs
 # idempotently update the block without touching the user's own content.
-$HomeClaudeSrc = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName\home-claude.md"
+$HomeClaudeSrc = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName\CLAUDE.md"
 $HomeClaudeDst = Join-Path $HOME '.claude\CLAUDE.md'
 $BeginMarker = "<!-- claude-harness orientation: $MarketplaceName (begin) -->"
 $EndMarker   = "<!-- claude-harness orientation: $MarketplaceName (end) -->"
@@ -237,7 +237,7 @@ if (Test-Path -LiteralPath $HomeClaudeSrc) {
         Log "[ok] Added $MarketplaceName orientation block to ~/.claude/CLAUDE.md"
     }
 } else {
-    Log "[info] No home-claude.md in this marketplace — skipping ~/.claude/CLAUDE.md injection."
+    Log "[info] No CLAUDE.md in this marketplace — skipping ~/.claude/CLAUDE.md injection."
 }
 
 # -----------------------------------------------------------------------------
