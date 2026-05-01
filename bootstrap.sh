@@ -252,12 +252,13 @@ fi
 # Inject harness orientation into ~/.claude/CLAUDE.md
 # -----------------------------------------------------------------------------
 # Claude Code auto-loads ~/.claude/CLAUDE.md in every session, regardless of
-# working directory. The harness ships home-claude.md at its repo root with
-# orientation content (skill namespace, credentials path, authoring guidance).
-# We splice it into ~/.claude/CLAUDE.md between marketplace-scoped markers so
-# multiple harnesses can coexist and re-runs idempotently update the block
-# without touching the user's own global instructions.
-HOME_CLAUDE_SRC="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME/home-claude.md"
+# working directory. The harness ships its CLAUDE.md at the repo root with
+# orientation content (3-layer architecture, directory structure, credentials,
+# skill-authoring guidance). We splice it into ~/.claude/CLAUDE.md between
+# marketplace-scoped markers so multiple harnesses can coexist and re-runs
+# idempotently update the block without touching the user's own global
+# instructions.
+HOME_CLAUDE_SRC="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME/CLAUDE.md"
 HOME_CLAUDE_DST="$HOME/.claude/CLAUDE.md"
 BEGIN_MARKER="<!-- claude-harness orientation: $MARKETPLACE_NAME (begin) -->"
 END_MARKER="<!-- claude-harness orientation: $MARKETPLACE_NAME (end) -->"
@@ -293,7 +294,7 @@ if [[ -f "$HOME_CLAUDE_SRC" ]]; then
     log "[ok] Added $MARKETPLACE_NAME orientation block to ~/.claude/CLAUDE.md"
   fi
 else
-  log "[info] No home-claude.md in this marketplace — skipping ~/.claude/CLAUDE.md injection."
+  log "[info] No CLAUDE.md in this marketplace — skipping ~/.claude/CLAUDE.md injection."
 fi
 
 # -----------------------------------------------------------------------------
