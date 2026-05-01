@@ -249,6 +249,54 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# Inject harness orientation into ~/.claude/CLAUDE.md
+# -----------------------------------------------------------------------------
+# Claude Code auto-loads ~/.claude/CLAUDE.md in every session, regardless of
+# working directory. The harness ships home-claude.md at its repo root with
+# orientation content (skill namespace, credentials path, authoring guidance).
+# We splice it into ~/.claude/CLAUDE.md between marketplace-scoped markers so
+# multiple harnesses can coexist and re-runs idempotently update the block
+# without touching the user's own global instructions.
+HOME_CLAUDE_SRC="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME/home-claude.md"
+HOME_CLAUDE_DST="$HOME/.claude/CLAUDE.md"
+BEGIN_MARKER="<!-- claude-harness orientation: $MARKETPLACE_NAME (begin) -->"
+END_MARKER="<!-- claude-harness orientation: $MARKETPLACE_NAME (end) -->"
+
+if [[ -f "$HOME_CLAUDE_SRC" ]]; then
+  mkdir -p "$(dirname "$HOME_CLAUDE_DST")"
+  touch "$HOME_CLAUDE_DST"
+  # Write to a tmp file then atomically replace — avoids partial-write corruption
+  # if bootstrap is interrupted mid-splice.
+  TMP_CLAUDE_MD="$(mktemp)"
+  if grep -Fq "$BEGIN_MARKER" "$HOME_CLAUDE_DST" 2>/dev/null; then
+    # Existing block — replace content between markers in-place.
+    awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v src="$HOME_CLAUDE_SRC" '
+      $0 == begin { print; while ((getline line < src) > 0) print line; close(src); skip=1; next }
+      $0 == end   { print; skip=0; next }
+      !skip       { print }
+    ' "$HOME_CLAUDE_DST" > "$TMP_CLAUDE_MD"
+    mv "$TMP_CLAUDE_MD" "$HOME_CLAUDE_DST"
+    log "[ok] Updated $MARKETPLACE_NAME orientation block in ~/.claude/CLAUDE.md"
+  else
+    # First install — append a new block. Leading newline if file is non-empty
+    # and doesn't already end with one.
+    cp "$HOME_CLAUDE_DST" "$TMP_CLAUDE_MD"
+    if [[ -s "$TMP_CLAUDE_MD" ]] && [[ "$(tail -c1 "$TMP_CLAUDE_MD" | wc -l)" -eq 0 ]]; then
+      printf '\n' >> "$TMP_CLAUDE_MD"
+    fi
+    {
+      printf '\n%s\n' "$BEGIN_MARKER"
+      cat "$HOME_CLAUDE_SRC"
+      printf '%s\n' "$END_MARKER"
+    } >> "$TMP_CLAUDE_MD"
+    mv "$TMP_CLAUDE_MD" "$HOME_CLAUDE_DST"
+    log "[ok] Added $MARKETPLACE_NAME orientation block to ~/.claude/CLAUDE.md"
+  fi
+else
+  log "[info] No home-claude.md in this marketplace — skipping ~/.claude/CLAUDE.md injection."
+fi
+
+# -----------------------------------------------------------------------------
 # Done
 # -----------------------------------------------------------------------------
 echo ""
