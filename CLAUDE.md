@@ -1,15 +1,12 @@
 # CLAUDE.md — claude-harness-installer
 
-*Last Edited: 2026-04-21*
+*Last Edited: 2026-05-02*
 
 Operator notes for editing the bootstrap installer. Not shipped to end users.
 
 ## Read first
 
-For architecture, lifecycle, and the full gotcha catalog, read these directives — they're the canonical source and apply across the whole harness, not just this repo:
-
-- `~/.claude/directives/palisades-labs-harness.md` — three-repo architecture, three roles, lifecycle walkthroughs, credential discipline, distribution model.
-- `~/.claude/directives/palisades-labs-harness-troubleshooting.md` — every known failure mode plus the guard or fix for it. Read the **§ Session gotchas — 2026-04-21** subsection in particular before editing `bootstrap.sh`.
+For architecture, lifecycle, and the gotcha catalog that apply across the whole harness ecosystem (not just this repo), the maintainer keeps reference docs locally — typically under `~/.claude/references/` (or `~/.claude/directives/` on machines that haven't migrated to the new vocabulary). Those docs aren't shipped with this repo because they include consultant-private notes; ask the maintainer if you need access.
 
 This file covers only the operator workflow specific to editing the installer scripts.
 

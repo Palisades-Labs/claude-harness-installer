@@ -74,8 +74,8 @@ After install: open a NEW terminal window (so the rc changes take effect), then 
 - **`age` install fails.** Check that the machine has internet access to GitHub releases. As a manual fallback, install `age` yourself from https://github.com/FiloSottile/age/releases and re-run.
 - **`raw.githubusercontent.com` serves an old version of the script after a recent push.** GitHub's CDN can lag 5–30+ minutes. Use the commit-SHA-pinned URL (`/<sha>/bootstrap.sh` instead of `/main/bootstrap.sh`) until it catches up.
 
-For the full troubleshooting reference (admin + consultant), see `~/.claude/directives/palisades-labs-harness-troubleshooting.md`.
+For deeper troubleshooting beyond this list (admin + maintainer scope), contact the harness maintainer.
 
 ## Maintenance
 
-Maintained by Aaron Melamed (aaron@iteroapp.ai) / Palisades Labs.
+Maintained by Palisades Labs (aaron@iteroapp.ai).
