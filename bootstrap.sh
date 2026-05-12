@@ -9,19 +9,28 @@
 #     bash <(curl -fsSL https://raw.githubusercontent.com/Palisades-Labs/claude-harness-installer/main/bootstrap.sh) --decrypt <org>/<repo>
 #
 # Prereq: the client marketplace must already be added + synced in Claude
-# Desktop. Bootstrap reads credentials.env.age from
-#     ~/.claude/plugins/marketplaces/<marketplace-name>/credentials/credentials.env.age
-# where marketplace_name = basename(repo) with any "-claude-harness" suffix stripped.
-# If that file is missing, bootstrap errors with "marketplace not synced yet".
+# Desktop. Bootstrap probes ~/.claude/plugins/marketplaces/ for a directory
+# matching one of these names (in order):
+#   1. <repo-basename>                    (e.g. insidescale-claude-harness)
+#   2. <repo-basename> minus -claude-harness suffix (e.g. insidescale)
+#   3. <repo-basename> minus -harness suffix
+# It picks the first one that contains credentials/credentials.env.age. If
+# none match, errors with "marketplace not synced yet".
 #
 # What this does (idempotent):
 #   1. Verifies `age` is installed.
-#   2. Derives marketplace_name from <org>/<repo>.
+#   2. Probes for the marketplace directory by name candidates.
 #   3. Confirms the marketplace sync directory + credentials.env.age exist.
 #   4. Prompts for the setup passphrase your admin sent you separately.
 #   5. Stores passphrase in macOS Keychain / Linux ~/.claude/credentials/.passphrase (chmod 600).
 #   6. Decrypts to ~/.claude/credentials/credentials.env (chmod 600).
 #   7. Adds a one-time source stanza to your shell rc so new terminals pick up the keys.
+#   8. Splices the harness's orientation content into ~/.claude/CLAUDE.md. If the
+#      marketplace ships a plugin splice script at
+#      plugins/<primary-plugin>/scripts/install-globals.sh, delegates to it
+#      (the plugin owns the splice target — typically the plugin-overlay
+#      CLAUDE.md, not the repo-root one). Otherwise falls back to splicing
+#      the marketplace's repo-root CLAUDE.md.
 #
 # Does NOT: install Claude Code, fetch PATs, merge settings.json, or register
 # the marketplace. Those are handled by Claude Desktop / separate installer paths.
@@ -63,10 +72,27 @@ if [[ "$DECRYPT_MODE" -ne 1 || -z "$CLIENT_REPO" || "$CLIENT_REPO" != */* ]]; th
 fi
 
 REPO_NAME="${CLIENT_REPO##*/}"
-# Strip '-claude-harness' or '-harness' suffix to match the marketplace key
-# Claude Desktop uses (e.g. test-client-harness → test-client).
-MARKETPLACE_NAME="${REPO_NAME%-claude-harness}"
-MARKETPLACE_NAME="${MARKETPLACE_NAME%-harness}"
+
+# Find the marketplace directory by probing common name conventions. The
+# directory name on disk equals the `name` field in marketplace.json, which a
+# client can set to anything — historically the stripped form (e.g.
+# `insidescale`), but increasingly the full repo name (`insidescale-claude-harness`).
+# Try each candidate in order, picking the first that has the expected
+# credentials.env.age inside. The probe sidesteps the previous brittle
+# hardcoded strip.
+MARKETPLACE_NAME=""
+for _candidate in "$REPO_NAME" "${REPO_NAME%-claude-harness}" "${REPO_NAME%-harness}"; do
+  if [[ -f "$HOME/.claude/plugins/marketplaces/$_candidate/credentials/credentials.env.age" ]]; then
+    MARKETPLACE_NAME="$_candidate"
+    break
+  fi
+done
+# Fallback if no candidate matched — keep the legacy derivation so the
+# downstream "marketplace not synced yet" error names a useful path.
+if [[ -z "$MARKETPLACE_NAME" ]]; then
+  MARKETPLACE_NAME="${REPO_NAME%-claude-harness}"
+  MARKETPLACE_NAME="${MARKETPLACE_NAME%-harness}"
+fi
 
 log "Client repo:       $CLIENT_REPO"
 log "Marketplace name:  $MARKETPLACE_NAME"
@@ -252,18 +278,31 @@ fi
 # Inject harness orientation into ~/.claude/CLAUDE.md
 # -----------------------------------------------------------------------------
 # Claude Code auto-loads ~/.claude/CLAUDE.md in every session, regardless of
-# working directory. The harness ships its CLAUDE.md at the repo root with
-# orientation content (3-layer architecture, directory structure, credentials,
-# skill-authoring guidance). We splice it into ~/.claude/CLAUDE.md between
-# marketplace-scoped markers so multiple harnesses can coexist and re-runs
-# idempotently update the block without touching the user's own global
-# instructions.
-HOME_CLAUDE_SRC="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME/CLAUDE.md"
+# working directory. We inject the harness's orientation content there.
+#
+# Preferred path: if the synced marketplace ships a plugin-owned splice script
+# at plugins/<primary-plugin>/scripts/install-globals.sh, invoke it. That keeps
+# the splice logic (markers, source file, idempotency) owned by the plugin
+# author rather than baked into this bootstrap — and lets the plugin point at
+# its OWN CLAUDE.md (the team-facing overlay) rather than the repo-root
+# CLAUDE.md (the maintainer overview). Convention: the "primary" plugin's
+# directory name matches the marketplace name.
+#
+# Legacy fallback: if no plugin splice script exists, splice the marketplace's
+# repo-root CLAUDE.md directly. Preserves behavior for harnesses that haven't
+# adopted install-globals.sh yet.
+MARKETPLACE_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME"
+PRIMARY_PLUGIN_DIR="$MARKETPLACE_DIR/plugins/$MARKETPLACE_NAME"
+PLUGIN_SPLICE_SCRIPT="$PRIMARY_PLUGIN_DIR/scripts/install-globals.sh"
+HOME_CLAUDE_SRC="$MARKETPLACE_DIR/CLAUDE.md"
 HOME_CLAUDE_DST="$HOME/.claude/CLAUDE.md"
 BEGIN_MARKER="<!-- claude-harness orientation: $MARKETPLACE_NAME (begin) -->"
 END_MARKER="<!-- claude-harness orientation: $MARKETPLACE_NAME (end) -->"
 
-if [[ -f "$HOME_CLAUDE_SRC" ]]; then
+if [[ -x "$PLUGIN_SPLICE_SCRIPT" ]]; then
+  log "Delegating orientation splice to plugin script at $PLUGIN_SPLICE_SCRIPT"
+  CLAUDE_PLUGIN_ROOT="$PRIMARY_PLUGIN_DIR" bash "$PLUGIN_SPLICE_SCRIPT"
+elif [[ -f "$HOME_CLAUDE_SRC" ]]; then
   mkdir -p "$(dirname "$HOME_CLAUDE_DST")"
   touch "$HOME_CLAUDE_DST"
   # Write to a tmp file then atomically replace — avoids partial-write corruption
@@ -277,7 +316,7 @@ if [[ -f "$HOME_CLAUDE_SRC" ]]; then
       !skip       { print }
     ' "$HOME_CLAUDE_DST" > "$TMP_CLAUDE_MD"
     mv "$TMP_CLAUDE_MD" "$HOME_CLAUDE_DST"
-    log "[ok] Updated $MARKETPLACE_NAME orientation block in ~/.claude/CLAUDE.md"
+    log "[ok] Updated $MARKETPLACE_NAME orientation block in ~/.claude/CLAUDE.md (legacy splice — no plugin script present)"
   else
     # First install — append a new block. Leading newline if file is non-empty
     # and doesn't already end with one.
@@ -291,10 +330,10 @@ if [[ -f "$HOME_CLAUDE_SRC" ]]; then
       printf '%s\n' "$END_MARKER"
     } >> "$TMP_CLAUDE_MD"
     mv "$TMP_CLAUDE_MD" "$HOME_CLAUDE_DST"
-    log "[ok] Added $MARKETPLACE_NAME orientation block to ~/.claude/CLAUDE.md"
+    log "[ok] Added $MARKETPLACE_NAME orientation block to ~/.claude/CLAUDE.md (legacy splice — no plugin script present)"
   fi
 else
-  log "[info] No CLAUDE.md in this marketplace — skipping ~/.claude/CLAUDE.md injection."
+  log "[info] No CLAUDE.md or plugin install-globals.sh in this marketplace — skipping ~/.claude/CLAUDE.md injection."
 fi
 
 # -----------------------------------------------------------------------------
