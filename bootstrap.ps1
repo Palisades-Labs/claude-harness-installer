@@ -12,20 +12,27 @@
 #     .\bootstrap.ps1 -Decrypt -Repo <org>/<repo>
 #
 # Prereq: the client marketplace must already be added + synced in Claude
-# Desktop. Bootstrap reads credentials.env.age from
-#     ~/.claude/plugins/marketplaces/<marketplace-name>/credentials.env.age
-# where marketplace_name = basename(repo) with any "-claude-harness" suffix stripped.
-# If that file is missing, bootstrap errors with "marketplace not synced yet".
+# Desktop. Bootstrap probes ~/.claude/plugins/marketplaces/ for a directory
+# matching one of these names (in order):
+#   1. <repo-basename>                              (e.g. insidescale-claude-harness)
+#   2. <repo-basename> minus -claude-harness suffix (e.g. insidescale)
+#   3. <repo-basename> minus -harness suffix
+# It picks the first one that contains credentials/credentials.env.age. If
+# none match, errors with "marketplace not synced yet".
 #
 # What this does (idempotent):
 #   1. Verifies `age` is installed.
-#   2. Derives marketplace_name from <org>/<repo>.
+#   2. Probes for the marketplace directory by name candidates.
 #   3. Confirms the marketplace sync directory + credentials.env.age exist.
 #   4. Prompts for the setup passphrase your admin sent you separately.
 #   5. Stores passphrase DPAPI-protected at ~/.claude/credentials/.passphrase.
 #   6. Decrypts to ~/.claude/credentials/credentials.env (owner-only ACL).
 #   7. Adds a one-time source stanza to your PowerShell $PROFILE so new
 #      shells pick up the keys.
+#   8. Splices the harness's orientation content into ~/.claude/CLAUDE.md.
+#      Prefers the plugin overlay CLAUDE.md (team-facing operating rules) at
+#      plugins/<primary-plugin>/CLAUDE.md, falling back to the marketplace
+#      root CLAUDE.md (maintainer overview) when no plugin overlay exists.
 #
 # Does NOT: install Claude Code, fetch PATs, merge settings.json, or register
 # the marketplace. Those are handled by Claude Desktop / separate installer paths.
@@ -58,9 +65,32 @@ if (-not $Decrypt -or -not $Repo -or $Repo -notmatch '^[^/]+/[^/]+$') {
 }
 
 $RepoName = $Repo.Split('/')[-1]
-# Strip '-claude-harness' suffix if present; matches bootstrap.sh and /onboard-client.
-# This is the Option C invariant.
-$MarketplaceName = $RepoName -replace '-claude-harness$', ''
+
+# Find the marketplace directory by probing common name conventions. The
+# directory name on disk equals the `name` field in marketplace.json, which a
+# client can set to anything — historically the stripped form (e.g.
+# `insidescale`), but increasingly the full repo name. Try each candidate in
+# order, picking the first that has the expected credentials.env.age inside.
+# Mirrors the same probe in bootstrap.sh.
+$MarketplaceName = ''
+$NameCandidates = @(
+    $RepoName,
+    ($RepoName -replace '-claude-harness$', ''),
+    ($RepoName -replace '-harness$', '')
+)
+foreach ($_candidate in $NameCandidates) {
+    $probe = Join-Path $HOME ".claude\plugins\marketplaces\$_candidate\credentials\credentials.env.age"
+    if (Test-Path -LiteralPath $probe) {
+        $MarketplaceName = $_candidate
+        break
+    }
+}
+# Fallback if no candidate matched — keep the legacy derivation so the
+# downstream "marketplace not synced yet" error names a useful path.
+if (-not $MarketplaceName) {
+    $MarketplaceName = $RepoName -replace '-claude-harness$', ''
+    $MarketplaceName = $MarketplaceName -replace '-harness$', ''
+}
 
 Log "Client repo:       $Repo"
 Log "Marketplace name:  $MarketplaceName"
@@ -79,13 +109,16 @@ if (-not (Get-Command age -ErrorAction SilentlyContinue)) {
 # 2) Verify credentials.env.age exists in the Desktop-synced marketplace dir
 # -----------------------------------------------------------------------------
 $CredsDir = Join-Path $HOME '.claude\credentials'
-$AgeFile  = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName\credentials.env.age"
+# Path matches bootstrap.sh: the encrypted credentials file lives in a
+# `credentials/` subdirectory of the marketplace. (Earlier bootstrap.ps1
+# omitted the subdir, which would have failed against any real harness.)
+$AgeFile  = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName\credentials\credentials.env.age"
 
 # Check BEFORE prompting for the passphrase. No point asking for a secret if
 # the input file is missing. Error wording matches bootstrap.sh byte-for-byte
 # (with forward slashes in the path, per the bash version).
 if (-not (Test-Path -LiteralPath $AgeFile)) {
-    Die "credentials.env.age not found at ~/.claude/plugins/marketplaces/$MarketplaceName/credentials.env.age — marketplace not synced yet. Add it in Claude Desktop and wait for sync before re-running."
+    Die "credentials.env.age not found at ~/.claude/plugins/marketplaces/$MarketplaceName/credentials/credentials.env.age — marketplace not synced yet. Add it in Claude Desktop and wait for sync before re-running."
 }
 
 # -----------------------------------------------------------------------------
@@ -200,10 +233,24 @@ if (Test-Path '$credsFilePath') { Get-Content '$credsFilePath' | Where-Object { 
 # 7) Inject harness orientation into ~/.claude/CLAUDE.md
 # -----------------------------------------------------------------------------
 # Claude Code auto-loads ~/.claude/CLAUDE.md in every session. Splice the
-# harness's CLAUDE.md (shipped at the marketplace root) between
-# marketplace-scoped markers so multiple harnesses can coexist and re-runs
-# idempotently update the block without touching the user's own content.
-$HomeClaudeSrc = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName\CLAUDE.md"
+# harness's CLAUDE.md content between marketplace-scoped markers so multiple
+# harnesses can coexist and re-runs idempotently update the block without
+# touching the user's own content.
+#
+# Source selection mirrors bootstrap.sh's delegation logic: prefer the plugin
+# overlay CLAUDE.md (team-facing operating rules) when present, fall back to
+# the marketplace root CLAUDE.md (maintainer overview) otherwise. Convention:
+# the "primary" plugin's directory name matches the marketplace name.
+$MarketplaceDir   = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName"
+$PrimaryPluginDir = Join-Path $MarketplaceDir "plugins\$MarketplaceName"
+$PluginOverlay    = Join-Path $PrimaryPluginDir 'CLAUDE.md'
+$RepoRootClaude   = Join-Path $MarketplaceDir 'CLAUDE.md'
+
+if (Test-Path -LiteralPath $PluginOverlay) {
+    $HomeClaudeSrc = $PluginOverlay
+} else {
+    $HomeClaudeSrc = $RepoRootClaude
+}
 $HomeClaudeDst = Join-Path $HOME '.claude\CLAUDE.md'
 $BeginMarker = "<!-- claude-harness orientation: $MarketplaceName (begin) -->"
 $EndMarker   = "<!-- claude-harness orientation: $MarketplaceName (end) -->"
