@@ -1,26 +1,38 @@
 #!/usr/bin/env bash
-# Palisades-Labs Claude Code harness bootstrap (decrypt-only).
+# Palisades-Labs Claude Code harness bootstrap.
 #
-# Decrypts the client's age-encrypted credentials file (shipped via Claude
-# Desktop marketplace sync) into ~/.claude/credentials/credentials.env so
-# skills that need API keys (Tavily, Avoma, etc.) can read them at runtime.
+# Two modes, same downstream behavior (decrypt credentials → splice CLAUDE.md
+# → wire shell rc). Differ only in where the .age file and plugin assets come
+# from:
+#
+#   --decrypt <org>/<repo>   Employee mode. Reads inputs from Claude Desktop's
+#                            marketplace sync cache at
+#                            ~/.claude/plugins/marketplaces/<name>/. Requires
+#                            Desktop to have added + synced the marketplace.
+#
+#   --admin   <org>/<repo>   Admin mode. Fetches inputs directly from the
+#                            GitHub repo via `gh api`. No Claude Desktop, no
+#                            PAT, no marketplace sync wait. Requires `gh` to
+#                            be installed AND authenticated (`gh auth status`).
 #
 # Usage:
+#     # Employee (after Claude Desktop sync):
 #     bash <(curl -fsSL https://raw.githubusercontent.com/Palisades-Labs/claude-harness-installer/main/bootstrap.sh) --decrypt <org>/<repo>
 #
-# Prereq: the client marketplace must already be added + synced in Claude
-# Desktop. Bootstrap probes ~/.claude/plugins/marketplaces/ for a directory
-# matching one of these names (in order):
-#   1. <repo-basename>                    (e.g. insidescale-claude-harness)
-#   2. <repo-basename> minus -claude-harness suffix (e.g. insidescale)
-#   3. <repo-basename> minus -harness suffix
-# It picks the first one that contains credentials/credentials.env.age. If
-# none match, errors with "marketplace not synced yet".
+#     # Admin (no Claude Desktop required):
+#     bash <(curl -fsSL https://raw.githubusercontent.com/Palisades-Labs/claude-harness-installer/main/bootstrap.sh) --admin <org>/<repo>
 #
-# What this does (idempotent):
+# What this does (idempotent, both modes):
 #   1. Verifies `age` is installed.
-#   2. Probes for the marketplace directory by name candidates.
-#   3. Confirms the marketplace sync directory + credentials.env.age exist.
+#   2. Resolves the marketplace name and locates credentials.env.age.
+#      - --decrypt: probes ~/.claude/plugins/marketplaces/ for a directory
+#                   matching <repo-basename>, then <basename-minus-claude-harness>,
+#                   then <basename-minus-harness>; picks the first containing
+#                   credentials/credentials.env.age.
+#      - --admin:   derives the marketplace name from the repo basename
+#                   (minus -claude-harness / -harness suffix) and fetches
+#                   credentials.env.age + plugin orientation files via gh api.
+#   3. Confirms credentials.env.age was located/fetched.
 #   4. Prompts for the setup passphrase your admin sent you separately.
 #   5. Stores passphrase in macOS Keychain / Linux ~/.claude/credentials/.passphrase (chmod 600).
 #   6. Decrypts to ~/.claude/credentials/credentials.env (chmod 600).
@@ -46,18 +58,24 @@ err() { printf "\033[1;31m[error]\033[0m %s\n" "$*" >&2; }
 # oh-my-zsh, nvm, etc.
 main() {
 DECRYPT_MODE=0
+ADMIN_MODE=0
 POS_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --decrypt) DECRYPT_MODE=1 ;;
+    --admin)   ADMIN_MODE=1 ;;
     -h|--help)
       cat <<'USAGE'
-Usage: bootstrap.sh --decrypt <org>/<repo>
+Usage:
+  bootstrap.sh --decrypt <org>/<repo>   # Employee: reads from Claude Desktop marketplace sync
+  bootstrap.sh --admin   <org>/<repo>   # Admin: fetches from GitHub via `gh api` (no Desktop needed)
 
-Decrypts credentials.env.age from the synced Claude Desktop marketplace
-directory and writes ~/.claude/credentials/credentials.env (chmod 600).
+Both modes decrypt credentials.env.age to ~/.claude/credentials/credentials.env
+(chmod 600), splice the plugin orientation into ~/.claude/CLAUDE.md, and add a
+source stanza to your shell rc.
 
-Prereq: marketplace must be added and synced in Claude Desktop first.
+--decrypt prereq: marketplace must be added + synced in Claude Desktop first.
+--admin   prereq: `gh` installed and authenticated (`gh auth status` succeeds).
 USAGE
       exit 0 ;;
     *) POS_ARGS+=("$arg") ;;
@@ -65,31 +83,44 @@ USAGE
 done
 
 CLIENT_REPO="${POS_ARGS[0]:-}"
-if [[ "$DECRYPT_MODE" -ne 1 || -z "$CLIENT_REPO" || "$CLIENT_REPO" != */* ]]; then
-  err "Usage: bootstrap.sh --decrypt <org>/<repo>  (e.g. Palisades-Labs/insidescale-claude-harness)"
-  err "Prereq: add + sync the client marketplace in Claude Desktop before running."
+if [[ "$DECRYPT_MODE" -eq 1 && "$ADMIN_MODE" -eq 1 ]]; then
+  err "--decrypt and --admin are mutually exclusive. Pick one."
+  exit 1
+fi
+if [[ "$DECRYPT_MODE" -ne 1 && "$ADMIN_MODE" -ne 1 ]]; then
+  err "Pick a mode: --decrypt <org>/<repo>  (employee)  or  --admin <org>/<repo>  (admin)."
+  exit 1
+fi
+if [[ -z "$CLIENT_REPO" || "$CLIENT_REPO" != */* ]]; then
+  err "Missing <org>/<repo> argument. Example: bootstrap.sh --admin Palisades-Labs/insidescale-claude-harness"
   exit 1
 fi
 
 REPO_NAME="${CLIENT_REPO##*/}"
 
-# Find the marketplace directory by probing common name conventions. The
-# directory name on disk equals the `name` field in marketplace.json, which a
-# client can set to anything — historically the stripped form (e.g.
-# `insidescale`), but increasingly the full repo name (`insidescale-claude-harness`).
-# Try each candidate in order, picking the first that has the expected
-# credentials.env.age inside. The probe sidesteps the previous brittle
-# hardcoded strip.
-MARKETPLACE_NAME=""
-for _candidate in "$REPO_NAME" "${REPO_NAME%-claude-harness}" "${REPO_NAME%-harness}"; do
-  if [[ -f "$HOME/.claude/plugins/marketplaces/$_candidate/credentials/credentials.env.age" ]]; then
-    MARKETPLACE_NAME="$_candidate"
-    break
+# Resolve marketplace name. Two strategies:
+#   --decrypt: probe ~/.claude/plugins/marketplaces/ for a directory matching
+#              <repo-basename>, <basename-minus-claude-harness>, or
+#              <basename-minus-harness>. The on-disk name equals the `name`
+#              field in marketplace.json, which can be anything — historically
+#              the stripped form (e.g. `insidescale`), but increasingly the
+#              full repo name. Pick the first candidate with credentials.env.age
+#              inside.
+#   --admin:   no local cache exists; derive from the repo basename directly
+#              (same as the decrypt-mode fallback when its probe finds nothing).
+if [[ "$DECRYPT_MODE" -eq 1 ]]; then
+  MARKETPLACE_NAME=""
+  for _candidate in "$REPO_NAME" "${REPO_NAME%-claude-harness}" "${REPO_NAME%-harness}"; do
+    if [[ -f "$HOME/.claude/plugins/marketplaces/$_candidate/credentials/credentials.env.age" ]]; then
+      MARKETPLACE_NAME="$_candidate"
+      break
+    fi
+  done
+  if [[ -z "$MARKETPLACE_NAME" ]]; then
+    MARKETPLACE_NAME="${REPO_NAME%-claude-harness}"
+    MARKETPLACE_NAME="${MARKETPLACE_NAME%-harness}"
   fi
-done
-# Fallback if no candidate matched — keep the legacy derivation so the
-# downstream "marketplace not synced yet" error names a useful path.
-if [[ -z "$MARKETPLACE_NAME" ]]; then
+else
   MARKETPLACE_NAME="${REPO_NAME%-claude-harness}"
   MARKETPLACE_NAME="${MARKETPLACE_NAME%-harness}"
 fi
@@ -138,6 +169,21 @@ _install_age() {
     log "[ok] Added ~/.local/bin to PATH in $rc_file"
   fi
 }
+
+# Admin-mode prereqs: gh installed + authenticated. Check these BEFORE the
+# age auto-download below so we fail fast if the admin needs to run gh auth
+# login first — no point spending bandwidth on age if we can't fetch the .age
+# file afterward.
+if [[ "$ADMIN_MODE" -eq 1 ]]; then
+  if ! command -v gh &>/dev/null; then
+    err "gh CLI not installed. Install with: brew install gh, then run gh auth login, then re-run this script."
+    exit 1
+  fi
+  if ! gh auth status &>/dev/null; then
+    err "gh is not authenticated. Run gh auth login (pick HTTPS + web browser), then re-run this script."
+    exit 1
+  fi
+fi
 
 # age may exist outside PATH (e.g. /opt/homebrew/bin on Apple Silicon without
 # Homebrew shell init). Check common locations before downloading.
@@ -213,13 +259,73 @@ fi
 CREDS_DIR="$HOME/.claude/credentials"
 mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
 
-# Verify the age-encrypted credentials file exists in the Desktop-synced
-# marketplace directory BEFORE prompting for the passphrase. No point asking
-# for a secret if the input file is missing.
-AGE_FILE="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials/credentials.env.age"
-if [[ ! -f "$AGE_FILE" ]]; then
-  err "credentials.env.age not found at ~/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials/credentials.env.age — marketplace not synced yet. Add it in Claude Desktop and wait for sync before re-running."
-  exit 1
+# Locate or fetch the encrypted credentials file BEFORE prompting for the
+# passphrase. No point asking for a secret if the input file is missing.
+#
+# --decrypt: read from Claude Desktop's marketplace sync cache.
+# --admin:   fetch directly from GitHub via `gh api` into a tempdir, alongside
+#            the plugin's CLAUDE.md + install-globals.sh so the splice section
+#            further down can invoke install-globals.sh unchanged with
+#            CLAUDE_PLUGIN_ROOT pointing at the tempdir.
+if [[ "$ADMIN_MODE" -eq 1 ]]; then
+  # gh prereqs were checked above (fail-fast); proceed directly to fetch.
+  TMP_FETCH_DIR="$(mktemp -d -t harness-admin-XXXXXX)"
+  trap 'rm -rf "$TMP_FETCH_DIR"' EXIT
+
+  log "Fetching credentials/credentials.env.age from $CLIENT_REPO via gh api..."
+  AGE_FILE="$TMP_FETCH_DIR/credentials.env.age"
+  if ! gh api -H 'Accept: application/vnd.github.raw' \
+       "/repos/$CLIENT_REPO/contents/credentials/credentials.env.age" \
+       > "$AGE_FILE" 2>/dev/null; then
+    err "Could not fetch credentials/credentials.env.age from $CLIENT_REPO. Check that gh has read access to the repo and the file exists at credentials/credentials.env.age."
+    exit 1
+  fi
+  if [[ ! -s "$AGE_FILE" ]]; then
+    err "Fetched credentials.env.age but the response was empty. The file may not exist in $CLIENT_REPO at credentials/credentials.env.age."
+    exit 1
+  fi
+  log "[ok] Fetched credentials.env.age"
+
+  # Fetch the plugin's orientation assets into a layout that mirrors plugins/<name>/
+  # so install-globals.sh works unchanged with CLAUDE_PLUGIN_ROOT set to the
+  # tempdir path. Both files are optional — if absent, the splice section
+  # further down logs an [info] and skips the splice.
+  PRIMARY_PLUGIN_DIR="$TMP_FETCH_DIR/plugin"
+  mkdir -p "$PRIMARY_PLUGIN_DIR/scripts"
+
+  if gh api -H 'Accept: application/vnd.github.raw' \
+       "/repos/$CLIENT_REPO/contents/plugins/$MARKETPLACE_NAME/CLAUDE.md" \
+       > "$PRIMARY_PLUGIN_DIR/CLAUDE.md" 2>/dev/null && \
+     [[ -s "$PRIMARY_PLUGIN_DIR/CLAUDE.md" ]]; then
+    log "[ok] Fetched plugins/$MARKETPLACE_NAME/CLAUDE.md"
+  else
+    rm -f "$PRIMARY_PLUGIN_DIR/CLAUDE.md"
+    log "[info] No plugins/$MARKETPLACE_NAME/CLAUDE.md in $CLIENT_REPO — orientation splice will be skipped"
+  fi
+
+  if gh api -H 'Accept: application/vnd.github.raw' \
+       "/repos/$CLIENT_REPO/contents/plugins/$MARKETPLACE_NAME/scripts/install-globals.sh" \
+       > "$PRIMARY_PLUGIN_DIR/scripts/install-globals.sh" 2>/dev/null && \
+     [[ -s "$PRIMARY_PLUGIN_DIR/scripts/install-globals.sh" ]]; then
+    chmod +x "$PRIMARY_PLUGIN_DIR/scripts/install-globals.sh"
+    log "[ok] Fetched plugins/$MARKETPLACE_NAME/scripts/install-globals.sh"
+  else
+    rm -f "$PRIMARY_PLUGIN_DIR/scripts/install-globals.sh"
+  fi
+
+  MARKETPLACE_DIR="$TMP_FETCH_DIR"
+  HOME_CLAUDE_SRC="$PRIMARY_PLUGIN_DIR/CLAUDE.md"
+  PLUGIN_SPLICE_SCRIPT="$PRIMARY_PLUGIN_DIR/scripts/install-globals.sh"
+else
+  AGE_FILE="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials/credentials.env.age"
+  if [[ ! -f "$AGE_FILE" ]]; then
+    err "credentials.env.age not found at ~/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials/credentials.env.age — marketplace not synced yet. Add it in Claude Desktop and wait for sync before re-running."
+    exit 1
+  fi
+  MARKETPLACE_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME"
+  PRIMARY_PLUGIN_DIR="$MARKETPLACE_DIR/plugins/$MARKETPLACE_NAME"
+  PLUGIN_SPLICE_SCRIPT="$PRIMARY_PLUGIN_DIR/scripts/install-globals.sh"
+  HOME_CLAUDE_SRC="$MARKETPLACE_DIR/CLAUDE.md"
 fi
 
 log "You will be prompted for the setup passphrase your admin sent you separately."
@@ -291,10 +397,10 @@ fi
 # Legacy fallback: if no plugin splice script exists, splice the marketplace's
 # repo-root CLAUDE.md directly. Preserves behavior for harnesses that haven't
 # adopted install-globals.sh yet.
-MARKETPLACE_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME"
-PRIMARY_PLUGIN_DIR="$MARKETPLACE_DIR/plugins/$MARKETPLACE_NAME"
-PLUGIN_SPLICE_SCRIPT="$PRIMARY_PLUGIN_DIR/scripts/install-globals.sh"
-HOME_CLAUDE_SRC="$MARKETPLACE_DIR/CLAUDE.md"
+#
+# PRIMARY_PLUGIN_DIR / PLUGIN_SPLICE_SCRIPT / HOME_CLAUDE_SRC / MARKETPLACE_DIR
+# were set further up in the mode branch (decrypt mode points at the local
+# marketplace cache; admin mode points at the gh-api-fetched tempdir).
 HOME_CLAUDE_DST="$HOME/.claude/CLAUDE.md"
 BEGIN_MARKER="<!-- claude-harness orientation: $MARKETPLACE_NAME (begin) -->"
 END_MARKER="<!-- claude-harness orientation: $MARKETPLACE_NAME (end) -->"
