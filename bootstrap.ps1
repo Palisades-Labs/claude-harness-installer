@@ -109,10 +109,54 @@ if (-not (Get-Command age -ErrorAction SilentlyContinue)) {
 # 2) Verify credentials.env.age exists in the Desktop-synced marketplace dir
 # -----------------------------------------------------------------------------
 $CredsDir = Join-Path $HOME '.claude\credentials'
+# The marketplace directory is the Claude Desktop checkout of the client repo;
+# everything we read (the .age below, the CLAUDE.md later) lives under it.
+$MarketplaceDir = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName"
 # Path matches bootstrap.sh: the encrypted credentials file lives in a
 # `credentials/` subdirectory of the marketplace. (Earlier bootstrap.ps1
 # omitted the subdir, which would have failed against any real harness.)
-$AgeFile  = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName\credentials\credentials.env.age"
+$AgeFile  = Join-Path $MarketplaceDir 'credentials\credentials.env.age'
+
+# Auto-heal a stale marketplace checkout BEFORE reading its credentials (parity
+# with bootstrap.sh). Claude Desktop is supposed to keep this checkout current
+# with GitHub, but that sync can silently freeze (observed in the field: a
+# checkout stuck weeks / dozens of commits behind, so every decrypt produced
+# stale credentials with no error surfaced). If the marketplace is a git
+# checkout behind its upstream, fast-forward it here so we always decrypt the
+# CURRENT credentials. ff-only is non-destructive and fails closed: on a
+# dirty/diverged/offline/auth-gated checkout it leaves the tree untouched, warns,
+# and we decrypt whatever is present rather than blocking the user.
+# GIT_TERMINAL_PROMPT=0 stops a private-repo auth failure from hanging on a
+# hidden credential prompt.
+if ((Test-Path -LiteralPath (Join-Path $MarketplaceDir '.git')) -and (Get-Command git -ErrorAction SilentlyContinue)) {
+    $env:GIT_TERMINAL_PROMPT = '0'
+    # git writes progress to stderr and returns non-zero on a failed fetch/pull;
+    # under $ErrorActionPreference='Stop' (set above) PowerShell 7.4+ would THROW
+    # on that non-zero exit instead of setting $LASTEXITCODE, which would abort
+    # bootstrap on an offline/diverged checkout. Run the probe under 'Continue'
+    # and gate purely on $LASTEXITCODE so every failure path just warns + proceeds.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        git -C $MarketplaceDir fetch -q origin 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $behind = (git -C $MarketplaceDir rev-list --count 'HEAD..@{u}' 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $behind -match '^\d+$' -and [int]$behind -gt 0) {
+                Log "Marketplace checkout is $behind commit(s) behind — updating so credentials are current."
+                git -C $MarketplaceDir pull --ff-only -q 2>$null
+                if ($LASTEXITCODE -eq 0) {
+                    Log "[ok] Marketplace updated to latest — decrypting current credentials."
+                } else {
+                    Warn "Could not fast-forward the marketplace checkout (dirty, diverged, or offline). Credentials may be STALE. In Claude Desktop, run: /plugin marketplace update $MarketplaceName"
+                }
+            }
+        } else {
+            Warn "Could not reach GitHub to check for marketplace updates (offline?) — using the currently-synced credentials."
+        }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+}
 
 # Check BEFORE prompting for the passphrase. No point asking for a secret if
 # the input file is missing. Error wording matches bootstrap.sh byte-for-byte
@@ -241,7 +285,7 @@ if (Test-Path '$credsFilePath') { Get-Content '$credsFilePath' | Where-Object { 
 # overlay CLAUDE.md (team-facing operating rules) when present, fall back to
 # the marketplace root CLAUDE.md (maintainer overview) otherwise. Convention:
 # the "primary" plugin's directory name matches the marketplace name.
-$MarketplaceDir   = Join-Path $HOME ".claude\plugins\marketplaces\$MarketplaceName"
+# $MarketplaceDir is defined above (before the decrypt step).
 $PrimaryPluginDir = Join-Path $MarketplaceDir "plugins\$MarketplaceName"
 $PluginOverlay    = Join-Path $PrimaryPluginDir 'CLAUDE.md'
 $RepoRootClaude   = Join-Path $MarketplaceDir 'CLAUDE.md'

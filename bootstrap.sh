@@ -213,12 +213,43 @@ fi
 CREDS_DIR="$HOME/.claude/credentials"
 mkdir -p "$CREDS_DIR" && chmod 700 "$CREDS_DIR"
 
+# The marketplace directory is the Claude Desktop checkout of the client repo;
+# everything we read (the .age below, the CLAUDE.md later) lives under it.
+MARKETPLACE_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME"
+
+# Auto-heal a stale marketplace checkout BEFORE reading its credentials. Claude
+# Desktop is supposed to keep this checkout current with GitHub, but that sync
+# can silently freeze (observed in the field: a checkout stuck weeks / dozens of
+# commits behind, so every decrypt produced stale credentials — an invalid API
+# key plus a mangled one — with no error surfaced anywhere). If the marketplace
+# is a git checkout behind its upstream, fast-forward it here so we always
+# decrypt the CURRENT credentials. ff-only is non-destructive and fails closed:
+# on a dirty/diverged/offline/auth-gated checkout it leaves the tree untouched,
+# warns, and we decrypt whatever is present rather than blocking the user.
+# GIT_TERMINAL_PROMPT=0 stops a private-repo auth failure from hanging bootstrap
+# on a hidden credential prompt.
+if [[ -d "$MARKETPLACE_DIR/.git" ]]; then
+  if GIT_TERMINAL_PROMPT=0 git -C "$MARKETPLACE_DIR" fetch -q origin 2>/dev/null; then
+    _behind="$(git -C "$MARKETPLACE_DIR" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)"
+    if [[ "$_behind" =~ ^[0-9]+$ ]] && [[ "$_behind" -gt 0 ]]; then
+      log "Marketplace checkout is $_behind commit(s) behind — updating so credentials are current."
+      if GIT_TERMINAL_PROMPT=0 git -C "$MARKETPLACE_DIR" pull --ff-only -q 2>/dev/null; then
+        log "[ok] Marketplace updated to latest — decrypting current credentials."
+      else
+        err "[warn] Could not fast-forward the marketplace checkout (dirty, diverged, or offline). Credentials may be STALE. In Claude Desktop, run: /plugin marketplace update $MARKETPLACE_NAME"
+      fi
+    fi
+  else
+    log "[warn] Could not reach GitHub to check for marketplace updates (offline?) — using the currently-synced credentials."
+  fi
+fi
+
 # Verify the age-encrypted credentials file exists in the Desktop-synced
 # marketplace directory BEFORE prompting for the passphrase. No point asking
 # for a secret if the input file is missing.
-AGE_FILE="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials/credentials.env.age"
+AGE_FILE="$MARKETPLACE_DIR/credentials/credentials.env.age"
 if [[ ! -f "$AGE_FILE" ]]; then
-  err "credentials.env.age not found at ~/.claude/plugins/marketplaces/$MARKETPLACE_NAME/credentials/credentials.env.age — marketplace not synced yet. Add it in Claude Desktop and wait for sync before re-running."
+  err "credentials.env.age not found at $AGE_FILE — marketplace not synced yet. Add it in Claude Desktop and wait for sync before re-running."
   exit 1
 fi
 
@@ -291,7 +322,7 @@ fi
 # Legacy fallback: if no plugin splice script exists, splice the marketplace's
 # repo-root CLAUDE.md directly. Preserves behavior for harnesses that haven't
 # adopted install-globals.sh yet.
-MARKETPLACE_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME"
+# MARKETPLACE_DIR is defined above (before the decrypt step).
 PRIMARY_PLUGIN_DIR="$MARKETPLACE_DIR/plugins/$MARKETPLACE_NAME"
 PLUGIN_SPLICE_SCRIPT="$PRIMARY_PLUGIN_DIR/scripts/install-globals.sh"
 HOME_CLAUDE_SRC="$MARKETPLACE_DIR/CLAUDE.md"
