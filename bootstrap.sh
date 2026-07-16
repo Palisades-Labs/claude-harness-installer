@@ -226,17 +226,22 @@ MARKETPLACE_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE_NAME"
 # decrypt the CURRENT credentials. ff-only is non-destructive and fails closed:
 # on a dirty/diverged/offline/auth-gated checkout it leaves the tree untouched,
 # warns, and we decrypt whatever is present rather than blocking the user.
-# GIT_TERMINAL_PROMPT=0 stops a private-repo auth failure from hanging bootstrap
-# on a hidden credential prompt.
-if [[ -d "$MARKETPLACE_DIR/.git" ]]; then
-  if GIT_TERMINAL_PROMPT=0 git -C "$MARKETPLACE_DIR" fetch -q origin 2>/dev/null; then
+# We must never HANG on this fetch/pull. GIT_TERMINAL_PROMPT=0 disables git's
+# built-in terminal prompter, and `-c credential.interactive=false` tells a
+# credential helper (e.g. Git Credential Manager on Windows) not to pop its own
+# GUI dialog — together they make a private-repo auth failure fail fast instead
+# of blocking. The `command -v git` guard mirrors the PowerShell path so a
+# machine without git skips cleanly rather than emitting a misleading "offline"
+# warning.
+if [[ -d "$MARKETPLACE_DIR/.git" ]] && command -v git &>/dev/null; then
+  if GIT_TERMINAL_PROMPT=0 git -c credential.interactive=false -C "$MARKETPLACE_DIR" fetch -q origin 2>/dev/null; then
     _behind="$(git -C "$MARKETPLACE_DIR" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)"
     if [[ "$_behind" =~ ^[0-9]+$ ]] && [[ "$_behind" -gt 0 ]]; then
       log "Marketplace checkout is $_behind commit(s) behind — updating so credentials are current."
-      if GIT_TERMINAL_PROMPT=0 git -C "$MARKETPLACE_DIR" pull --ff-only -q 2>/dev/null; then
+      if GIT_TERMINAL_PROMPT=0 git -c credential.interactive=false -C "$MARKETPLACE_DIR" pull --ff-only -q 2>/dev/null; then
         log "[ok] Marketplace updated to latest — decrypting current credentials."
       else
-        err "[warn] Could not fast-forward the marketplace checkout (dirty, diverged, or offline). Credentials may be STALE. In Claude Desktop, run: /plugin marketplace update $MARKETPLACE_NAME"
+        log "[warn] Could not fast-forward the marketplace checkout (dirty, diverged, or offline). Credentials may be STALE. In Claude Desktop, run: /plugin marketplace update $MARKETPLACE_NAME"
       fi
     fi
   else

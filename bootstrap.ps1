@@ -126,9 +126,13 @@ $AgeFile  = Join-Path $MarketplaceDir 'credentials\credentials.env.age'
 # CURRENT credentials. ff-only is non-destructive and fails closed: on a
 # dirty/diverged/offline/auth-gated checkout it leaves the tree untouched, warns,
 # and we decrypt whatever is present rather than blocking the user.
-# GIT_TERMINAL_PROMPT=0 stops a private-repo auth failure from hanging on a
-# hidden credential prompt.
-if ((Test-Path -LiteralPath (Join-Path $MarketplaceDir '.git')) -and (Get-Command git -ErrorAction SilentlyContinue)) {
+# We must never HANG on this fetch/pull. GIT_TERMINAL_PROMPT=0 disables git's
+# built-in terminal prompter, and `-c credential.interactive=false` tells a
+# credential helper (Git Credential Manager on Windows) not to pop its own GUI
+# auth dialog — together they make a private-repo auth failure fail fast instead
+# of blocking.
+if ((Test-Path -LiteralPath (Join-Path $MarketplaceDir '.git') -PathType Container) -and (Get-Command git -ErrorAction SilentlyContinue)) {
+    $prevGTP = $env:GIT_TERMINAL_PROMPT
     $env:GIT_TERMINAL_PROMPT = '0'
     # git writes progress to stderr and returns non-zero on a failed fetch/pull;
     # under $ErrorActionPreference='Stop' (set above) PowerShell 7.4+ would THROW
@@ -138,12 +142,12 @@ if ((Test-Path -LiteralPath (Join-Path $MarketplaceDir '.git')) -and (Get-Comman
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        git -C $MarketplaceDir fetch -q origin 2>$null
+        git -c credential.interactive=false -C $MarketplaceDir fetch -q origin 2>$null
         if ($LASTEXITCODE -eq 0) {
             $behind = (git -C $MarketplaceDir rev-list --count 'HEAD..@{u}' 2>$null)
             if ($LASTEXITCODE -eq 0 -and $behind -match '^\d+$' -and [int]$behind -gt 0) {
                 Log "Marketplace checkout is $behind commit(s) behind — updating so credentials are current."
-                git -C $MarketplaceDir pull --ff-only -q 2>$null
+                git -c credential.interactive=false -C $MarketplaceDir pull --ff-only -q 2>$null
                 if ($LASTEXITCODE -eq 0) {
                     Log "[ok] Marketplace updated to latest — decrypting current credentials."
                 } else {
@@ -155,6 +159,9 @@ if ((Test-Path -LiteralPath (Join-Path $MarketplaceDir '.git')) -and (Get-Comman
         }
     } finally {
         $ErrorActionPreference = $prevEAP
+        # Restore GIT_TERMINAL_PROMPT to its prior state (unset it if it was unset).
+        if ($null -eq $prevGTP) { Remove-Item Env:\GIT_TERMINAL_PROMPT -ErrorAction SilentlyContinue }
+        else { $env:GIT_TERMINAL_PROMPT = $prevGTP }
     }
 }
 
