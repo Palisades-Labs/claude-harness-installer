@@ -1,5 +1,7 @@
 # CLAUDE.md — claude-harness-installer
 
+> **v2 note (2026-08-26):** this repo is now a thin shim host (`v2.sh`); the real setup lives in the client harness repo at `setup/setup.sh`. The satellite repos referenced below (`plugin-client-admin`, `claude-harness-master`, `marketplace-admin`) are being retired per the client repo's `docs/cutover-runbook.md`. The v1 workflow notes below apply only while v1 machines remain.
+
 *Last Edited: 2026-05-02*
 
 Operator notes for editing the bootstrap installer. Not shipped to end users.
