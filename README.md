@@ -1,6 +1,12 @@
 # claude-harness-installer
 
-Public bootstrap that decrypts the Palisades-Labs Claude Code harness's encrypted credentials file on a developer's machine. Two scripts, one job:
+**v2 (current):** `v2.sh` is a thin public shim. It bootstraps a bare Mac (Xcode command line tools → Homebrew → GitHub CLI → GitHub sign-in), then fetches and runs the real setup script from the client's private harness repo (`setup/setup.sh` there). Everything substantive lives in the client repo; this repo stays a fetcher so the one-liner works against a private repo.
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Palisades-Labs/claude-harness-installer/main/v2.sh) <org>/<repo> [--admin]
+```
+
+**v1 (deprecated, kept for machines mid-migration):** the age-passphrase decrypt installers below. They print a deprecation notice but still work.
 
 - `bootstrap.sh` — macOS + Linux
 - `bootstrap.ps1` — Windows
