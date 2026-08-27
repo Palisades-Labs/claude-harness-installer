@@ -57,6 +57,9 @@ err() { printf "\033[1;31m[error]\033[0m %s\n" "$*" >&2; }
 # pipe) BEFORE any executable line runs. Standard pattern used by rustup,
 # oh-my-zsh, nvm, etc.
 main() {
+  echo "[bootstrap] NOTE: this v1 installer is deprecated. New setups use v2:" >&2
+  echo "[bootstrap]   bash <(curl -fsSL https://raw.githubusercontent.com/Palisades-Labs/claude-harness-installer/main/v2.sh) <org>/<repo>" >&2
+  echo "[bootstrap] Existing machines keep working; your admin will send the migration command." >&2
 DECRYPT_MODE=0
 ADMIN_MODE=0
 POS_ARGS=()
