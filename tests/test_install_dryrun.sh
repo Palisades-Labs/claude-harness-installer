@@ -48,6 +48,7 @@ case "$1 ${2:-}" in
     fi;;
   "account get") echo "URL: acme.1password.com";;
   "item get")
+    [ -n "${STUB_ITEM_ERROR:-}" ] && { echo "[ERROR] 2026/10/02 23:18:31 $STUB_ITEM_ERROR" >&2; exit 1; }
     case "$*" in
       *label=repo*) echo "acme-co/acme-harness";;
       *label=credential*--reveal*) printf '%s\n' "$FAKE_TOKEN";;
@@ -136,6 +137,11 @@ run_case bash "$INSTALL" "$ADDR"
 for rc in .zprofile .zshrc; do [ "$(grep -c 'brew shellenv' "$H/$rc")" = 1 ]; assert "$rc: second run adds no second line" $?; done
 run_case env STUB_SETUP_RC=3 bash "$INSTALL" "$ADDR"
 [ "$RC" = 3 ]; assert "setup's failure is passed on" $?
+
+# ---- The 1Password approval was missed: says to approve it, changes nothing ----
+new_case
+run_case env STUB_ITEM_ERROR="error initializing client: authorization timeout" bash "$INSTALL" "$ADDR"
+[ "$RC" = 1 ] && grep -q "approval wasn't given in time" <<<"$OUT" && ! grep -q "Couldn't find" <<<"$OUT" && ! grep -qE '^git (config|clone)' "$EVENTS"; assert "missed approval: says to approve the prompt, no git change, no download" $?
 
 # ---- 1Password not ready yet: one plain message per state, then it carries on ----
 for spec in "integration-off|Integrate with 1Password CLI" "no-account|account isn't in it yet" "locked|locked or isn't answering"; do

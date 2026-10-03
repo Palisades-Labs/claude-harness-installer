@@ -198,25 +198,41 @@ credential() { # <approve|reject>; record on stdin
   git -c credential.helper= -c "credential.helper=$HELPER" -c credential.useHttpPath=true credential "$1"
 }
 
+# A 1Password read failed: was it a missed approval (the fix is to approve), or not?
+approval_missed() { grep -qiE 'authorization timeout|dismissed|timed out' "$1" 2>/dev/null; }
+APPROVAL_MSG="The 1Password approval wasn't given in time. Run the command again and approve the 1Password prompt (Touch ID or your Mac password)."
+
 # Step 5. Sets REPO.
 save_access_key() {
-  local token url path rc=0
+  local token url path rc=0 errf
   if [ "$DRY" = 1 ]; then
     say "[dry-run] read the repo name and access key from the 1Password item \"$ITEM\" and save the key in the Keychain for that repo only"
     return 0
   fi
-  REPO="$(op item get "$ITEM" --account "$ADDR" --fields label=repo </dev/null 2>/dev/null)" || REPO=""
+  errf="$(mktemp)"
+  REPO="$(op item get "$ITEM" --account "$ADDR" --fields label=repo </dev/null 2>"$errf")" || REPO=""
   if ! printf '%s' "$REPO" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
-    say "Couldn't find the \"$ITEM\" item in your 1Password (or its repo field is empty)."
-    say "Ask the person who manages Claude setup for your team to share it with you, then run the command again."
+    if approval_missed "$errf"; then
+      say "$APPROVAL_MSG"
+    else
+      say "Couldn't find the \"$ITEM\" item in your 1Password (or its repo field is empty)."
+      say "Ask the person who manages Claude setup for your team to share it with you, then run the command again."
+    fi
+    rm -f "$errf"
     return 1
   fi
   if own_github_access "$REPO"; then
+    rm -f "$errf"
     say "This Mac already reaches $REPO with its own GitHub sign-in; keeping that."
     return 0
   fi
-  token="$(op item get "$ITEM" --account "$ADDR" --fields label=credential --reveal </dev/null 2>/dev/null)" || token=""
-  [ -n "$token" ] || { say "The \"$ITEM\" item has no access key in its credential field. Tell the person who manages Claude setup for your team."; return 1; }
+  token="$(op item get "$ITEM" --account "$ADDR" --fields label=credential --reveal </dev/null 2>"$errf")" || token=""
+  if [ -z "$token" ]; then
+    if approval_missed "$errf"; then say "$APPROVAL_MSG"; else say "The \"$ITEM\" item has no access key in its credential field. Tell the person who manages Claude setup for your team."; fi
+    rm -f "$errf"
+    return 1
+  fi
+  rm -f "$errf"
   # Only our helper answers for this repo, so a personal GitHub login saved in the
   # Keychain can't be tried in its place. Other GitHub use is untouched.
   for url in "https://github.com/$REPO.git" "https://github.com/$REPO"; do
