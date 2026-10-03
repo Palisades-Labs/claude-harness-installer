@@ -22,8 +22,12 @@ item "Claude Setup Access" at run time.
 - The token only ever travels through a pipe into `git credential approve` sent to our helper
   alone (`git -c credential.helper= -c credential.helper=<helper> ...`). Never put it in argv,
   output or a file. The test fails if it appears anywhere.
-- A Mac whose own `gh` sign-in already reaches the repo is left alone, so the read-only token
-  never takes over a maintainer's pushes.
+- Before saving the token, the script removes what an earlier run added for the repo and asks
+  git itself (`git ls-remote`, prompts off) whether the Mac's own sign-in reaches it. If it does,
+  nothing is added, so the read-only token never takes over a maintainer's pushes. The repo-scoped
+  settings include `username=x-access-token`, so a host-wide GitHub username can't hide the token.
+- Startup files are rewritten all or nothing (`safe_replace`: temp file beside the real file, then
+  a move; a symlink stays a symlink).
 - The hand-off contract with each customer's private repo: `setup/setup.sh` exists, receives
   `--admin`/`--dry-run`, and reads `HARNESS_SRC` (the download) and `HARNESS_REF` (hidden: a branch
   for pre-merge testing). Change `install.sh` and the customer's `setup.sh` together when that

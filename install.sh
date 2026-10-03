@@ -42,17 +42,39 @@ usage() {
   exit 2
 }
 
+# Replace a file's contents with a command's output, all or nothing: the output goes
+# to a temporary file next to the real file (a symlink is followed, so a symlinked
+# ~/.zshrc stays a symlink), the permissions are kept, and only then is it moved into
+# place. Any failure leaves the original file exactly as it was.
+safe_replace() { # <file> <command...>
+  local file="$1" target link tmp mode
+  shift
+  target="$file"
+  while [ -L "$target" ]; do
+    link="$(readlink "$target")" || return 1
+    case "$link" in /*) target="$link";; *) target="$(dirname "$target")/$link";; esac
+  done
+  tmp="$(mktemp "$(dirname "$target")/.$(basename "$target").XXXXXX" 2>/dev/null)" || return 1
+  [ -n "$tmp" ] || return 1
+  if "$@" > "$tmp"; then
+    if [ -e "$target" ]; then mode="$(stat -f %Lp "$target")"; else mode=644; fi
+    if chmod "$mode" "$tmp" && mv -f "$tmp" "$target"; then return 0; fi
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+prepend() { printf '%s\n' "$1"; if [ -f "$2" ]; then cat "$2"; fi; }
+
 # Put a line at the top of ~/.zprofile and ~/.zshrc unless the file already has
 # <already>. At the top, so any PATH change the person makes later still wins.
 persist_line() { # <line> <already>
-  local rc tmp
+  local rc
   for rc in "$HOME/.zprofile" "$HOME/.zshrc"; do
     if [ -f "$rc" ] && grep -qF -- "$2" "$rc"; then continue; fi
     if [ "$DRY" = 1 ]; then say "[dry-run] add to $rc: $1"; continue; fi
-    tmp="$(mktemp)"
-    { printf '%s\n' "$1"; if [ -f "$rc" ]; then cat "$rc"; fi; } > "$tmp"
-    cat "$tmp" > "$rc"
-    rm -f "$tmp"
+    safe_replace "$rc" prepend "$1" "$rc" \
+      || say "Couldn't add the Homebrew line to $rc; the file was left unchanged. Setup carries on."
   done
 }
 
@@ -187,15 +209,30 @@ wait_for_1password() {
   done
 }
 
-# True when this Mac's own GitHub sign-in already reaches the repo; then its git
-# setup is left alone (the key would otherwise take over that repo's pushes).
+# True when git itself, with this Mac's own sign-in and no prompts, reaches the repo.
+# Then its git setup is left alone (the key would otherwise take over that repo's pushes).
 own_github_access() { # <owner/repo>
-  command -v gh >/dev/null 2>&1 && gh api "repos/$1" --silent >/dev/null 2>&1
+  GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never git -c credential.interactive=false \
+    ls-remote "https://github.com/$1.git" HEAD >/dev/null 2>&1
 }
 
 # Send one credential record to our helper only (never to the person's other helpers).
 credential() { # <approve|reject>; record on stdin
   git -c credential.helper= -c "credential.helper=$HELPER" -c credential.useHttpPath=true credential "$1"
+}
+
+# Remove what an earlier run added for <repo>: the repo-scoped git settings for both
+# URL forms, and the saved key (sent to our helper only).
+forget_access_key() { # <owner/repo>
+  local url path
+  for url in "https://github.com/$1.git" "https://github.com/$1"; do
+    git config --global --unset-all "credential.$url.helper" >/dev/null 2>&1
+    git config --global --unset-all "credential.$url.useHttpPath" >/dev/null 2>&1
+    git config --global --unset-all "credential.$url.username" >/dev/null 2>&1
+  done
+  for path in "$1.git" "$1"; do
+    printf 'protocol=https\nhost=github.com\npath=%s\nusername=x-access-token\n\n' "$path" | credential reject >/dev/null 2>&1
+  done
 }
 
 # A 1Password read failed: was it a missed approval (the fix is to approve), or not?
@@ -209,7 +246,7 @@ save_access_key() {
     say "[dry-run] read the repo name and access key from the 1Password item \"$ITEM\" and save the key in the Keychain for that repo only"
     return 0
   fi
-  errf="$(mktemp)"
+  errf="$(mktemp 2>/dev/null)" || errf=/dev/null
   REPO="$(op item get "$ITEM" --account "$ADDR" --fields label=repo </dev/null 2>"$errf")" || REPO=""
   if ! printf '%s' "$REPO" | grep -qE '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
     if approval_missed "$errf"; then
@@ -218,32 +255,34 @@ save_access_key() {
       say "Couldn't find the \"$ITEM\" item in your 1Password (or its repo field is empty)."
       say "Ask the person who manages Claude setup for your team to share it with you, then run the command again."
     fi
-    rm -f "$errf"
+    [ "$errf" = /dev/null ] || rm -f "$errf"
     return 1
   fi
-  if own_github_access "$REPO"; then
-    rm -f "$errf"
-    say "This Mac already reaches $REPO with its own GitHub sign-in; keeping that."
-    return 0
-  fi
+  # Read the key before changing anything, so a missed approval leaves the Mac as it was.
   token="$(op item get "$ITEM" --account "$ADDR" --fields label=credential --reveal </dev/null 2>"$errf")" || token=""
   if [ -z "$token" ]; then
     if approval_missed "$errf"; then say "$APPROVAL_MSG"; else say "The \"$ITEM\" item has no access key in its credential field. Tell the person who manages Claude setup for your team."; fi
-    rm -f "$errf"
+    [ "$errf" = /dev/null ] || rm -f "$errf"
     return 1
   fi
-  rm -f "$errf"
-  # Only our helper answers for this repo, so a personal GitHub login saved in the
-  # Keychain can't be tried in its place. Other GitHub use is untouched.
+  [ "$errf" = /dev/null ] || rm -f "$errf"
+  # Ask git without anything an earlier run added: does this Mac's own sign-in work?
+  forget_access_key "$REPO"
+  if own_github_access "$REPO"; then
+    token=""
+    say "This Mac already reaches $REPO with its own GitHub sign-in; keeping that."
+    return 0
+  fi
+  # Only our helper answers for this repo, as user x-access-token (a host-wide GitHub
+  # username setting would otherwise hide the key). Other GitHub use is untouched.
   for url in "https://github.com/$REPO.git" "https://github.com/$REPO"; do
-    git config --global --unset-all "credential.$url.helper" >/dev/null 2>&1
     git config --global --add "credential.$url.helper" ""
     git config --global --add "credential.$url.helper" "$HELPER"
     git config --global "credential.$url.useHttpPath" true
+    git config --global "credential.$url.username" x-access-token
   done
   # printf is a shell builtin: the key reaches git's stdin, never a process argument.
   for path in "$REPO.git" "$REPO"; do
-    printf 'protocol=https\nhost=github.com\npath=%s\nusername=x-access-token\n\n' "$path" | credential reject >/dev/null 2>&1
     printf 'protocol=https\nhost=github.com\npath=%s\nusername=x-access-token\npassword=%s\n\n' "$path" "$token" | credential approve || rc=1
   done
   token=""

@@ -57,16 +57,29 @@ esac
 exit 0
 STUB
 
-  # git: logs argv; `credential approve` records only whether the key matched;
-  # `clone` creates a checkout whose setup/setup.sh records how it was started.
+  # git: logs argv. `config` runs the real git against the temp HOME. `credential
+  # approve` records only whether the key matched and keeps a "saved" marker that
+  # `reject` removes. `ls-remote` works only with this Mac's own sign-in
+  # (STUB_OWN_ACCESS=1) or with our helper configured and the key saved. `clone`
+  # creates a checkout whose setup/setup.sh records how it was started.
   cat > "$STUB/git" <<'STUB'
 #!/usr/bin/env bash
 printf 'git %s\n' "$*" >> "$EVENTS"
+case " $* " in
+  *" config "*) exec /usr/bin/git "$@";;
+  *" ls-remote "*)
+    [ "${STUB_OWN_ACCESS:-0}" = 1 ] && exit 0
+    /usr/bin/git config --global --get-all credential.https://github.com/acme-co/acme-harness.git.helper 2>/dev/null | grep -q . && [ -e "$STATE/key-saved" ] && exit 0
+    exit 128;;
+esac
 case "$*" in
   *"credential approve"*)
     p=""; pw=""; while IFS= read -r l && [ -n "$l" ]; do case "$l" in path=*) p="${l#path=}";; password=*) pw="${l#password=}";; esac; done
+    touch "$STATE/key-saved"
     if [ "$pw" = "$FAKE_TOKEN" ]; then echo "approve path=$p key_matches=1" >> "$EVENTS"; else echo "approve path=$p key_matches=0" >> "$EVENTS"; fi;;
-  *"credential reject"*) cat >/dev/null;;
+  *"credential reject"*)
+    p=""; while IFS= read -r l && [ -n "$l" ]; do case "$l" in path=*) p="${l#path=}";; esac; done
+    rm -f "$STATE/key-saved"; echo "reject path=$p" >> "$EVENTS";;
   clone*)
     for a in "$@"; do dest="$a"; done
     mkdir -p "$dest/setup"
@@ -78,7 +91,7 @@ STUB
 }
 
 run_case() { # [VAR=value...] <args...> -> OUT, RC
-  OUT="$(cd "$T" && env HOME="$H" EVENTS="$EVENTS" STATE="$STATE" SETUP_BREW_CANDIDATES="" \
+  OUT="$(cd "$T" && env GIT_CONFIG_NOSYSTEM=1 HOME="$H" EVENTS="$EVENTS" STATE="$STATE" SETUP_BREW_CANDIDATES="" \
     PATH="$STUB:/usr/bin:/bin" "$@" 2>&1)"; RC=$?
 }
 line_of() { grep -n -- "$1" "$EVENTS" | head -1 | cut -d: -f1; }
@@ -156,11 +169,47 @@ new_case
 run_case env STUB_APP_CLOSED=1 bash -c 'source "$1"; ADDR=acme.1password.com; op_state' _ "$INSTALL"
 [ "$OUT" = closed ] && ! grep -q '^op ' "$EVENTS"; assert "app not running: reported as closed, op never asked (also: sourcing runs nothing)" $?
 
-# ---- This Mac already reaches the repo with its own GitHub sign-in ----
+# ---- Own access is decided by git itself (I2); our settings go away once it works ----
+U1="https://github.com/acme-co/acme-harness.git"; U2="https://github.com/acme-co/acme-harness"
+ours() { for u in "$U1" "$U2"; do for k in helper useHttpPath username; do HOME="$H" GIT_CONFIG_NOSYSTEM=1 /usr/bin/git config --global --get-all "credential.$u.$k" 2>/dev/null | sed "s#^#$k=#"; done; done; }
+# test_gh_signed_in_without_git_creds: gh would say yes, git says no -> the key is saved
 new_case
 printf '#!/bin/sh\nprintf "gh %%s\\n" "$*" >> "$EVENTS"\nexit 0\n' > "$STUB/gh"; chmod +x "$STUB/gh"
 run_case bash "$INSTALL" "$ADDR"
-[ "$RC" = 0 ] && ! grep -q 'label=credential' "$EVENTS" && ! grep -q '^git config' "$EVENTS" && grep -q '^git clone' "$EVENTS"; assert "own GitHub access: git setup untouched, key not read, download still runs" $?
+[ "$RC" = 0 ] && grep -q 'key_matches=1' "$EVENTS" && ! grep -q '^gh ' "$EVENTS" && grep -q "^git -c credential.interactive=false ls-remote $U1 HEAD" "$EVENTS"; assert "test_gh_signed_in_without_git_creds: probes with git ls-remote (prompts off), saves the key" $?
+[ "$(ours | tr '\n' ' ')" = "helper= helper=osxkeychain useHttpPath=true username=x-access-token helper= helper=osxkeychain useHttpPath=true username=x-access-token " ]; assert "test_username_scoped: both URL forms set username=x-access-token" $?
+# test_no_flip_flop: a second run without own access keeps the key
+run_case bash "$INSTALL" "$ADDR"
+[ "$RC" = 0 ] && [ "$(ours | grep -c 'username=x-access-token')" = 2 ] && [ -e "$STATE/key-saved" ]; assert "test_no_flip_flop: second run without own access keeps the key" $?
+# test_own_access_removes_overrides: own sign-in works now -> our settings and saved key removed, download still runs
+run_case env STUB_OWN_ACCESS=1 bash "$INSTALL" "$ADDR"
+[ "$RC" = 0 ] && [ -z "$(ours)" ] && [ ! -e "$STATE/key-saved" ] && grep -q 'reject path=acme-co/acme-harness.git' "$EVENTS" && grep -q '^git clone' "$EVENTS"; assert "test_own_access_removes_overrides: settings unset for both URLs, key rejected, download runs" $?
+
+# test_host_username_regression (I3), real git + store helper: a host-wide github.com
+# username must not hide the key saved for x-access-token.
+new_case
+printf '#!/usr/bin/env bash\ncase " $* " in *" ls-remote "*) exit 128;; *" clone "*) for a in "$@"; do d="$a"; done; mkdir -p "$d/setup"; printf "#!/bin/sh\\nexit 0\\n" > "$d/setup/setup.sh"; exit 0;; esac\nexec /usr/bin/git "$@"\n' > "$STUB/git"; chmod +x "$STUB/git"
+HOME="$H" GIT_CONFIG_NOSYSTEM=1 /usr/bin/git config --global credential.https://github.com.username personal-user
+run_case env SETUP_CREDENTIAL_HELPER=store bash "$INSTALL" "$ADDR"
+FILL="$(cd "$T" && printf 'protocol=https\nhost=github.com\npath=acme-co/acme-harness.git\n\n' | env HOME="$H" GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 /usr/bin/git credential fill 2>/dev/null)"
+[ "$RC" = 0 ] && grep -qx 'username=x-access-token' <<<"$FILL" && [ "$(sed -n 's/^password=//p' <<<"$FILL")" = "$FAKE_TOKEN" ]; assert "test_host_username_regression: git credential fill returns the key despite credential.https://github.com.username" $?
+FILL=""
+
+# ---- I1: startup files are rewritten all or nothing ----
+# test_rc_unwritable_tmpdir: TMPDIR doesn't exist -> line still added, content kept
+new_case; printf 'export KEEP=1\n' > "$H/.zshrc"
+run_case env TMPDIR="$T/does-not-exist" bash "$INSTALL" "$ADDR"
+head -1 "$H/.zshrc" | grep -q 'Claude setup: Homebrew on PATH' && grep -qx 'export KEEP=1' "$H/.zshrc"; assert "test_rc_unwritable_tmpdir: missing TMPDIR doesn't matter; line added, content kept" $?
+# test_rc_mktemp_fails_leaves_file: no temporary file possible -> .zshrc byte-identical, says so
+new_case; printf 'export KEEP=1\n' > "$H/.zshrc"; cp "$H/.zshrc" "$T/zshrc.orig"
+chmod 555 "$H"
+run_case bash -c 'source "$1"; DRY=0; persist_line "eval brew-line  # Claude setup: Homebrew on PATH" "brew shellenv"' _ "$INSTALL"
+chmod 755 "$H"
+cmp -s "$H/.zshrc" "$T/zshrc.orig" && grep -q "left unchanged" <<<"$OUT"; assert "test_rc_mktemp_fails_leaves_file: .zshrc byte-identical, says so" $?
+# test_rc_symlink_kept: a symlinked .zshrc stays a symlink; its target is updated and keeps its mode
+new_case; mkdir -p "$T/dotfiles"; printf 'export KEEP=1\n' > "$T/dotfiles/zshrc"; chmod 640 "$T/dotfiles/zshrc"; ln -s "$T/dotfiles/zshrc" "$H/.zshrc"
+run_case bash "$INSTALL" "$ADDR"
+[ -L "$H/.zshrc" ] && head -1 "$T/dotfiles/zshrc" | grep -q 'Claude setup: Homebrew on PATH' && [ "$(stat -f %Lp "$T/dotfiles/zshrc")" = 640 ]; assert "test_rc_symlink_kept: symlink kept, target updated, mode 640 kept" $?
 
 echo "---"
 if [ "$FAILURES" -eq 0 ]; then echo "ALL PASS"; else echo "$FAILURES FAILURES"; exit 1; fi
