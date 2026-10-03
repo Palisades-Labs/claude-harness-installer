@@ -22,9 +22,11 @@ item "Claude Setup Access" at run time.
 - The token only ever travels through a pipe into `git credential approve` sent to our helper
   alone (`git -c credential.helper= -c credential.helper=<helper> ...`). Never put it in argv,
   output or a file. The test fails if it appears anywhere.
-- Before saving the token, the script removes what an earlier run added for the repo and asks
-  git itself (`git ls-remote`, prompts off) whether the Mac's own sign-in reaches it. If it does,
-  nothing is added, so the read-only token never takes over a maintainer's pushes. The repo-scoped
+- Before saving the token, the script removes what an earlier run added for the repo (only
+  settings carrying its `claudeSetupManaged=true` marker) and asks git itself (`git ls-remote`,
+  prompts off) whether the Mac's own sign-in reaches it. If it does, nothing is added, so the
+  read-only token never takes over a maintainer's pushes. Unmarked repo-scoped settings are never
+  touched: if they exist and access fails, the script adds nothing and says so. The repo-scoped
   settings include `username=x-access-token`, so a host-wide GitHub username can't hide the token.
 - Startup files are rewritten all or nothing (`safe_replace`: temp file beside the real file, then
   a move; a symlink stays a symlink).

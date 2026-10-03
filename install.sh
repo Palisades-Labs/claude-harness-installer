@@ -221,18 +221,30 @@ credential() { # <approve|reject>; record on stdin
   git -c credential.helper= -c "credential.helper=$HELPER" -c credential.useHttpPath=true credential "$1"
 }
 
-# Remove what an earlier run added for <repo>: the repo-scoped git settings for both
-# URL forms, and the saved key (sent to our helper only).
+# Our repo-scoped git settings carry this marker key (git ignores unknown keys), so a
+# later run removes only what it added, never a person's own settings for the repo.
+MARKER_KEY="claudeSetupManaged"
+
+# Remove what an earlier run added for <repo>, for each URL form that carries our
+# marker: our settings, and the saved key (sent to our helper only). Unmarked
+# settings are never touched.
 forget_access_key() { # <owner/repo>
-  local url path
+  local url path k
   for url in "https://github.com/$1.git" "https://github.com/$1"; do
-    git config --global --unset-all "credential.$url.helper" >/dev/null 2>&1
-    git config --global --unset-all "credential.$url.useHttpPath" >/dev/null 2>&1
-    git config --global --unset-all "credential.$url.username" >/dev/null 2>&1
-  done
-  for path in "$1.git" "$1"; do
+    [ "$(git config --global --get "credential.$url.$MARKER_KEY" 2>/dev/null)" = true ] || continue
+    for k in helper useHttpPath username "$MARKER_KEY"; do
+      git config --global --unset-all "credential.$url.$k" >/dev/null 2>&1
+    done
+    case "$url" in *.git) path="$1.git";; *) path="$1";; esac
     printf 'protocol=https\nhost=github.com\npath=%s\nusername=x-access-token\n\n' "$path" | credential reject >/dev/null 2>&1
   done
+}
+
+# True when any credential setting for <repo>'s URLs exists that we didn't add (in any
+# git config this Mac reads). Run after forget_access_key, so only unmarked ones are left.
+own_repo_settings() { # <owner/repo>
+  git config --list --name-only 2>/dev/null \
+    | grep -qiF -e "credential.https://github.com/$1.git." -e "credential.https://github.com/$1."
 }
 
 # A 1Password read failed: was it a missed approval (the fix is to approve), or not?
@@ -273,6 +285,14 @@ save_access_key() {
     say "This Mac already reaches $REPO with its own GitHub sign-in; keeping that."
     return 0
   fi
+  # The person has their own git settings for this repo and they don't work right now:
+  # leave them exactly as they are and add nothing.
+  if own_repo_settings "$REPO"; then
+    token=""
+    say "This Mac has its own git sign-in settings for $REPO, and they don't reach it right now."
+    say "They were left as they are and the shared access key wasn't added. Check your own GitHub sign-in, or ask the person who manages Claude setup for your team."
+    return 1
+  fi
   # Only our helper answers for this repo, as user x-access-token (a host-wide GitHub
   # username setting would otherwise hide the key). Other GitHub use is untouched.
   for url in "https://github.com/$REPO.git" "https://github.com/$REPO"; do
@@ -280,6 +300,7 @@ save_access_key() {
     git config --global --add "credential.$url.helper" "$HELPER"
     git config --global "credential.$url.useHttpPath" true
     git config --global "credential.$url.username" x-access-token
+    git config --global "credential.$url.$MARKER_KEY" true
   done
   # printf is a shell builtin: the key reaches git's stdin, never a process argument.
   for path in "$REPO.git" "$REPO"; do

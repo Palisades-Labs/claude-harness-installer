@@ -171,19 +171,30 @@ run_case env STUB_APP_CLOSED=1 bash -c 'source "$1"; ADDR=acme.1password.com; op
 
 # ---- Own access is decided by git itself (I2); our settings go away once it works ----
 U1="https://github.com/acme-co/acme-harness.git"; U2="https://github.com/acme-co/acme-harness"
-ours() { for u in "$U1" "$U2"; do for k in helper useHttpPath username; do HOME="$H" GIT_CONFIG_NOSYSTEM=1 /usr/bin/git config --global --get-all "credential.$u.$k" 2>/dev/null | sed "s#^#$k=#"; done; done; }
+ours() { for u in "$U1" "$U2"; do for k in helper useHttpPath username claudeSetupManaged; do HOME="$H" GIT_CONFIG_NOSYSTEM=1 /usr/bin/git config --global --get-all "credential.$u.$k" 2>/dev/null | sed "s#^#$k=#"; done; done; }
 # test_gh_signed_in_without_git_creds: gh would say yes, git says no -> the key is saved
 new_case
 printf '#!/bin/sh\nprintf "gh %%s\\n" "$*" >> "$EVENTS"\nexit 0\n' > "$STUB/gh"; chmod +x "$STUB/gh"
 run_case bash "$INSTALL" "$ADDR"
 [ "$RC" = 0 ] && grep -q 'key_matches=1' "$EVENTS" && ! grep -q '^gh ' "$EVENTS" && grep -q "^git -c credential.interactive=false ls-remote $U1 HEAD" "$EVENTS"; assert "test_gh_signed_in_without_git_creds: probes with git ls-remote (prompts off), saves the key" $?
-[ "$(ours | tr '\n' ' ')" = "helper= helper=osxkeychain useHttpPath=true username=x-access-token helper= helper=osxkeychain useHttpPath=true username=x-access-token " ]; assert "test_username_scoped: both URL forms set username=x-access-token" $?
+[ "$(ours | tr '\n' ' ')" = "helper= helper=osxkeychain useHttpPath=true username=x-access-token claudeSetupManaged=true helper= helper=osxkeychain useHttpPath=true username=x-access-token claudeSetupManaged=true " ]; assert "test_username_scoped: both URL forms set username=x-access-token and the claudeSetupManaged marker" $?
 # test_no_flip_flop: a second run without own access keeps the key
 run_case bash "$INSTALL" "$ADDR"
 [ "$RC" = 0 ] && [ "$(ours | grep -c 'username=x-access-token')" = 2 ] && [ -e "$STATE/key-saved" ]; assert "test_no_flip_flop: second run without own access keeps the key" $?
 # test_own_access_removes_overrides: own sign-in works now -> our settings and saved key removed, download still runs
 run_case env STUB_OWN_ACCESS=1 bash "$INSTALL" "$ADDR"
-[ "$RC" = 0 ] && [ -z "$(ours)" ] && [ ! -e "$STATE/key-saved" ] && grep -q 'reject path=acme-co/acme-harness.git' "$EVENTS" && grep -q '^git clone' "$EVENTS"; assert "test_own_access_removes_overrides: settings unset for both URLs, key rejected, download runs" $?
+[ "$RC" = 0 ] && [ -z "$(ours)" ] && [ ! -e "$STATE/key-saved" ] && grep -q 'reject path=acme-co/acme-harness.git' "$EVENTS" && grep -q '^git clone' "$EVENTS"; assert "test_own_access_removes_overrides: a marked earlier run is removed (settings, marker, saved key) and re-evaluated; download runs" $?
+
+# test_maintainer_own_helper_kept (I4): a repo-specific personal helper (no marker) that
+# works is kept, no key is saved or removed, and the download still runs
+new_case
+HOME="$H" GIT_CONFIG_NOSYSTEM=1 /usr/bin/git config --global credential."$U1".helper '!my-personal-helper'
+run_case env STUB_OWN_ACCESS=1 bash "$INSTALL" "$ADDR"
+[ "$RC" = 0 ] && [ "$(ours | tr '\n' ' ')" = "helper=!my-personal-helper " ] && ! grep -qE 'approve|reject path' "$EVENTS" && ! grep -q 'config --global --unset-all' "$EVENTS" && grep -q '^git clone' "$EVENTS"; assert "test_maintainer_own_helper_kept: personal repo helper untouched, no key saved or rejected" $?
+# ...and when it doesn't work right now: still untouched, nothing added, plain message, no download
+: > "$EVENTS"
+run_case bash "$INSTALL" "$ADDR"
+[ "$RC" = 1 ] && [ "$(ours | tr '\n' ' ')" = "helper=!my-personal-helper " ] && ! grep -qE 'approve|reject path|^git clone' "$EVENTS" && grep -q "has its own git sign-in settings" <<<"$OUT"; assert "test_maintainer_own_helper_failing_untouched: unmarked settings left, no key added, says so, exit 1" $?
 
 # test_host_username_regression (I3), real git + store helper: a host-wide github.com
 # username must not hide the key saved for x-access-token.
