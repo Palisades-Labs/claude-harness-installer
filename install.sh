@@ -35,6 +35,112 @@ say() { printf '%s\n' "$*"; }
 die() { say "$*"; exit 1; }
 run() { if [ "$DRY" = 1 ]; then say "[dry-run] $*"; else "$@"; fi; }
 
+# Homebrew queries keep stdout; changes keep all output in a private setup log.
+# The public installer embeds this block because it runs before downloading setup.
+export HOMEBREW_NO_ENV_HINTS=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_AUTO_UPDATE=1
+
+brew_preflight() {
+  local prefix dir owner
+  type -P brew >/dev/null 2>&1 || return 0
+  prefix="$(command brew --prefix 2>/dev/null)" || return 1
+  [ -n "$prefix" ] && [ -d "$prefix" ] || {
+    say "Homebrew isn't answering on this Mac. Tell Aaron before running setup again."
+    return 1
+  }
+  for dir in "$prefix" "$prefix/bin" "$prefix/sbin" "$prefix/etc" "$prefix/var" "$prefix/opt" "$prefix/lib" "$prefix/share" "$prefix/Cellar" "$prefix/Caskroom" "$prefix/Frameworks" "$prefix/Homebrew"; do
+    [ -e "$dir" ] || continue
+    if [ ! -w "$dir" ]; then
+      owner="$(stat -f %Su "$dir" 2>/dev/null)" || owner="another account"
+      say "Homebrew on this Mac belongs to another user account ($owner). Run setup from that account, or tell Aaron."
+      return 1
+    fi
+  done
+}
+
+brew_log_init() {
+  [ -n "${SETUP_BREW_LOG:-}" ] && [ -f "$SETUP_BREW_LOG" ] && return 0
+  local dir="$HOME/Library/Logs/claude-setup"
+  if ! mkdir -p "$dir" || ! chmod 700 "$dir"; then
+    say "Couldn't create the setup log folder at $dir. Tell Aaron."
+    return 1
+  fi
+  SETUP_BREW_LOG="$(mktemp "$dir/homebrew.XXXXXX")" || return 1
+  export SETUP_BREW_LOG
+}
+
+brew_failure() {
+  printf '%s\n' "Homebrew couldn't finish this step. Run setup again; if it fails again, send Aaron this log: $SETUP_BREW_LOG" >&2
+  tail -n 5 "$SETUP_BREW_LOG" >&2
+}
+
+brew() {
+  if [ "${DRY:-0}" = 1 ]; then
+    case "${1:-}" in
+      update|install|upgrade|uninstall|fetch) say "[dry-run] brew $*"; return 0;;
+      *) command brew "$@" 2>/dev/null; return;;
+    esac
+  fi
+  brew_log_init || return 1
+  case "${1:-}" in
+    update|install|upgrade|uninstall|fetch)
+      if command brew "$@" >>"$SETUP_BREW_LOG" 2>&1; then return 0; fi
+      brew_failure
+      return 1;;
+    *) command brew "$@" 2>>"$SETUP_BREW_LOG";;
+  esac
+}
+
+# This exported prefix is inherited by setup's helpers: one explicit refresh per run.
+brew_update_once() {
+  local prefix
+  prefix="$(command brew --prefix 2>/dev/null)" || return 1
+  [ "${SETUP_BREW_UPDATED:-}" = "$prefix" ] && return 0
+  say "Checking for the latest versions of the tools..."
+  brew update || return 1
+  if [ "${DRY:-0}" != 1 ]; then export SETUP_BREW_UPDATED="$prefix"; fi
+}
+
+# Download both casks before removing the working CLI. Keep its executable as a
+# last resort if Homebrew cannot restore even its already-downloaded regular cask.
+swap_op_beta() {
+  local old backup
+  say "Downloading the replacement 1Password tool before changing the current one..."
+  brew fetch --cask 1password-cli@beta && brew fetch --cask 1password-cli || return 1
+  old="$(command -v op)" || return 1
+  backup="$(mktemp -d)" || return 1
+  if ! cp -pL "$old" "$backup/op"; then rmdir "$backup"; return 1; fi
+  if ! brew uninstall --cask 1password-cli; then
+    if ! op_present; then mv -f "$backup/op" "$old" || return 1; fi
+    rm -f "$backup/op"; rmdir "$backup"
+    return 1
+  fi
+  if brew install --cask 1password-cli@beta && op_present; then
+    rm -f "$backup/op"; rmdir "$backup"
+    return 0
+  fi
+  say "The replacement didn't install. Restoring the regular 1Password tool..."
+  if brew install --cask 1password-cli && op_present; then
+    say "The regular 1Password tool was put back. Run setup again later; if it repeats, tell Aaron."
+  else
+    # mv replaces a broken Homebrew symlink rather than following its removed target.
+    if mv -f "$backup/op" "$old" && op_present; then
+      say "The previous 1Password tool was put back, but Homebrew couldn't repair its installation. Tell Aaron before running setup again."
+    else
+      say "Couldn't restore the 1Password tool. Tell Aaron; the saved copy is at $backup/op."
+      return 1
+    fi
+  fi
+  rm -f "$backup/op"; rmdir "$backup"
+  return 1
+}
+
+op_present() {
+  local p
+  hash -r
+  p="$(command -v op 2>/dev/null)" || return 1
+  [ -n "$p" ] && [ -x "$p" ]
+}
+
 usage() {
   say "Usage: install.sh <your 1Password sign-in address> [--admin] [--dry-run]"
   say "Example: install.sh yourteam.1password.com"
@@ -80,11 +186,11 @@ persist_line() { # <line> <already>
 
 brew_on_path() {
   local b
-  command -v brew >/dev/null 2>&1 && return 0
+  type -P brew >/dev/null 2>&1 && return 0
   for b in $BREW_CANDIDATES; do
-    if [ -x "$b" ]; then eval "$("$b" shellenv)"; break; fi
+    if [ -x "$b" ]; then eval "$("$b" shellenv 2>/dev/null)"; break; fi
   done
-  command -v brew >/dev/null 2>&1
+  type -P brew >/dev/null 2>&1
 }
 
 # True when the `op` that runs is 2.40.0-beta.02 or newer (or stable 2.40.0+).
@@ -105,6 +211,8 @@ EOF
 preflight() {
   [ "$(uname -s)" = "Darwin" ] || die "This setup works on a Mac only. Tell the person who manages Claude setup for your team which computer you're using."
   [ "$(id -u)" != 0 ] || die "Don't run this with sudo. Paste the command from your setup guide exactly as it is."
+  brew_on_path || true
+  brew_preflight || exit 1
   id -Gn | grep -qw admin || die "Your Mac account needs to be an administrator to install the tools Claude uses. Ask whoever manages this Mac to make your account an administrator (System Settings > Users & Groups), then run this again."
 }
 
@@ -123,14 +231,18 @@ ensure_homebrew() {
     # Keep the password valid while Homebrew downloads Apple's command line tools.
     ( while sudo -n -v 2>/dev/null && kill -0 "$$" 2>/dev/null; do sleep 50; done ) &
     keepalive=$!
-    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL "https://raw.githubusercontent.com/Homebrew/install/$HOMEBREW_INSTALL_COMMIT/install.sh")"
+    brew_log_init || exit 1
+    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL "https://raw.githubusercontent.com/Homebrew/install/$HOMEBREW_INSTALL_COMMIT/install.sh")" >>"$SETUP_BREW_LOG" 2>&1
     rc=$?
     kill "$keepalive" 2>/dev/null
     if [ "$rc" != 0 ] || ! brew_on_path; then
+      brew_failure
       die "Homebrew didn't install. Check the internet connection and run the command again. If it fails again, send the last few lines above to the person who manages Claude setup for your team."
     fi
   fi
-  persist_line "eval \"\$($(command -v brew) shellenv)\"  # Claude setup: Homebrew on PATH" "brew shellenv"
+  brew_preflight || exit 1
+  brew_update_once || exit 1
+  persist_line "eval \"\$($(type -P brew) shellenv)\"  # Claude setup: Homebrew on PATH" "brew shellenv"
 }
 
 ensure_1password() {
@@ -143,9 +255,17 @@ ensure_1password() {
     say "Installing the 1Password command-line tool..."
     run brew install -q --cask 1password-cli@beta || die "Couldn't install the 1Password command-line tool. Run the command again."
   elif ! op_new_enough; then
-    # An older tool still reads the item; the full setup updates it afterwards.
-    say "The 1Password command-line tool is an older version; setup updates it later."
+    if brew list --cask 1password-cli@beta >/dev/null 2>&1; then
+      say "Updating the 1Password command-line tool..."
+      run brew upgrade --cask 1password-cli@beta || exit 1
+    elif brew list --cask 1password-cli >/dev/null 2>&1; then
+      if [ "$DRY" = 1 ]; then say "[dry-run] download the beta before replacing the regular 1Password tool";
+      else swap_op_beta || exit 1; fi
+    else
+      die "The 1Password tool wasn't installed by Homebrew. Tell Aaron before running setup again."
+    fi
   fi
+  if [ "$DRY" != 1 ] && ! op_new_enough; then die "The 1Password tool is still too old. Tell Aaron before running setup again."; fi
 }
 
 has_account() { printf '%s' "$1" | grep -qF "\"$ADDR\""; }

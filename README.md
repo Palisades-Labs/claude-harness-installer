@@ -28,6 +28,12 @@ The argument is the company's 1Password sign-in address, for example
    the access works, and runs its `setup/setup.sh`. That script does the rest and
    prints the final report.
 
+Setup stops before changing anything if Homebrew belongs to another Mac account.
+Run setup from the account it names, or tell Aaron. Homebrew's detailed output goes
+to `~/Library/Logs/claude-setup/`; if a step fails, setup shows the last five lines
+and the log location. It downloads the replacement 1Password tool before removing
+the current one and restores the current tool if replacement fails.
+
 ## What it holds
 
 No secrets and no customer data. The script is the same for every customer: everything

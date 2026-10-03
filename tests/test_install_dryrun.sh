@@ -20,6 +20,32 @@ new_case() {
   for t in brew sudo open osascript; do
     printf '#!/bin/sh\nprintf "%s %%s\\n" "$*" >> "$EVENTS"\nexit 0\n' "$t" > "$STUB/$t"
   done
+  cat > "$STUB/brew" <<'STUB'
+#!/usr/bin/env bash
+[ "${1:-}" = --prefix ] && { echo "$STATE/prefix"; exit 0; }
+printf 'brew %s\n' "$*" >> "$EVENTS"
+printf 'stub brew noisy output\n'
+if [ "${1:-}" = update ]; then
+  printf 'brew quiet flags=%s/%s/%s\n' "$HOMEBREW_NO_ENV_HINTS" "$HOMEBREW_NO_INSTALL_CLEANUP" "$HOMEBREW_NO_AUTO_UPDATE" >> "$EVENTS"
+  if [ "${STUB_UPDATE_RC:-0}" = 1 ]; then for n in 1 2 3 4 5 6 7 8; do echo "failure detail $n"; done; fi
+  exit "${STUB_UPDATE_RC:-0}"
+fi
+[ "${1:-}" = fetch ] && exit "${STUB_FETCH_RC:-0}"
+if [ "${1:-}" = list ]; then [ "${*: -1}" = "1password-cli" ] && [ "${STUB_REGULAR:-0}" = 1 ]; exit $?; fi
+if [ "${1:-}" = uninstall ]; then rm -f "$(dirname "$0")/op"; fi
+if [ "${1:-}" = install ]; then
+  case "${*: -1}" in
+    1password-cli@beta)
+      [ "${STUB_BETA_RC:-0}" = 0 ] || exit 1
+      cp "$STATE/op.template" "$(dirname "$0")/op"; echo 2.40.0-beta.02 > "$STATE/version";;
+    1password-cli)
+      [ "${STUB_STABLE_RC:-0}" = 0 ] || exit 1
+      cp "$STATE/op.template" "$(dirname "$0")/op";;
+  esac
+fi
+exit 0
+STUB
+  mkdir -p "$STATE/prefix"
   printf '#!/bin/sh\necho Darwin\n' > "$STUB/uname"
   printf '#!/bin/sh\n[ "$1" = "-u" ] && { echo 501; exit 0; }\necho "${STUB_GROUPS:-staff everyone admin}"\n' > "$STUB/id"
   printf '#!/bin/sh\nexit 0\n' > "$STUB/sleep"
@@ -32,7 +58,7 @@ new_case() {
 #!/usr/bin/env bash
 printf 'op %s\n' "$*" >> "$EVENTS"
 case "$1 ${2:-}" in
-  "--version ") echo 2.40.0-beta.02;;
+  "--version ") if [ -f "$STATE/version" ]; then cat "$STATE/version"; else echo "${STUB_OP_VERSION:-2.40.0-beta.02}"; fi;;
   "account list")
     n=$(cat "$STATE/lists" 2>/dev/null || echo 0)
     forced=0; [ "${OP_BIOMETRIC_UNLOCK_ENABLED:-}" = true ] && forced=1
@@ -88,6 +114,7 @@ esac
 exit 0
 STUB
   chmod +x "$STUB"/*
+  cp "$STUB/op" "$STATE/op.template"
 }
 
 run_case() { # [VAR=value...] <args...> -> OUT, RC
@@ -221,6 +248,41 @@ cmp -s "$H/.zshrc" "$T/zshrc.orig" && grep -q "left unchanged" <<<"$OUT"; assert
 new_case; mkdir -p "$T/dotfiles"; printf 'export KEEP=1\n' > "$T/dotfiles/zshrc"; chmod 640 "$T/dotfiles/zshrc"; ln -s "$T/dotfiles/zshrc" "$H/.zshrc"
 run_case bash "$INSTALL" "$ADDR"
 [ -L "$H/.zshrc" ] && head -1 "$T/dotfiles/zshrc" | grep -q 'Claude setup: Homebrew on PATH' && [ "$(stat -f %Lp "$T/dotfiles/zshrc")" = 640 ]; assert "test_rc_symlink_kept: symlink kept, target updated, mode 640 kept" $?
+
+# C1: ownership rejection precedes startup-file, 1Password and git changes.
+new_case; chmod 555 "$STATE/prefix"
+run_case bash "$INSTALL" "$ADDR"
+[ "$RC" = 1 ] && grep -q "belongs to another user account" <<<"$OUT" && [ -z "$(ls -A "$H")" ] && [ ! -s "$EVENTS" ]; assert "unwritable prefix: stop before any change" $?
+chmod 755 "$STATE/prefix"
+new_case; mkdir "$STATE/prefix/Caskroom"; chmod 555 "$STATE/prefix/Caskroom"
+run_case bash "$INSTALL" "$ADDR"
+[ "$RC" = 1 ] && [ -x "$STUB/op" ] && [ ! -s "$EVENTS" ]; assert "unwritable cask folder: keep op and change nothing" $?
+chmod 755 "$STATE/prefix/Caskroom"
+# C2: stale regular CLI, failed beta download.
+new_case
+run_case env STUB_REGULAR=1 STUB_OP_VERSION=2.39.0 STUB_FETCH_RC=1 bash "$INSTALL" "$ADDR"
+[ "$RC" = 1 ] && [ -x "$STUB/op" ] && ! grep -q '^brew uninstall' "$EVENTS" && ! grep -q '^op item' "$EVENTS"; assert "failed beta fetch: keep regular op, stop before access-key reads" $?
+new_case
+run_case env STUB_REGULAR=1 STUB_OP_VERSION=2.39.0 bash "$INSTALL" "$ADDR"
+F=$(line_of '^brew fetch --cask 1password-cli@beta$'); U=$(line_of '^brew uninstall --cask 1password-cli$')
+[ "$RC" = 0 ] && [ -n "$F" ] && [ -n "$U" ] && [ "$F" -lt "$U" ]; assert "regular CLI: fetch beta before uninstall, install successfully" $?
+new_case
+run_case env STUB_REGULAR=1 STUB_OP_VERSION=2.39.0 STUB_BETA_RC=1 bash "$INSTALL" "$ADDR"
+[ "$RC" = 1 ] && [ -x "$STUB/op" ] && grep -q '^brew install --cask 1password-cli$' "$EVENTS" && grep -q 'regular 1Password tool was put back' <<<"$OUT"; assert "failed beta install: restore regular op and stop" $?
+new_case
+run_case env STUB_REGULAR=1 STUB_OP_VERSION=2.39.0 STUB_BETA_RC=1 STUB_STABLE_RC=1 bash "$INSTALL" "$ADDR"
+[ "$RC" = 1 ] && [ -x "$STUB/op" ] && grep -q 'previous 1Password tool was put back' <<<"$OUT"; assert "both installs fail: saved executable keeps op available" $?
+# C4: one refresh; only the failure tail escapes the private log.
+new_case
+run_case bash "$INSTALL" "$ADDR"
+[ "$RC" = 0 ] && [ "$(grep -c '^brew update$' "$EVENTS")" = 1 ] && ! grep -q 'stub brew noisy output' <<<"$OUT" && grep -rq 'stub brew noisy output' "$H/Library/Logs/claude-setup"; assert "one quiet brew refresh with detailed output in the log" $?
+grep -q '^brew quiet flags=1/1/1$' "$EVENTS"; assert "brew disables hints, cleanup and automatic refresh" $?
+new_case
+run_case env STUB_UPDATE_RC=1 bash "$INSTALL" "$ADDR"
+[ "$RC" = 1 ] && grep -q 'Library/Logs/claude-setup' <<<"$OUT" && grep -q 'failure detail 8' <<<"$OUT" && ! grep -q '^op ' "$EVENTS"; assert "refresh failure: show log tail and path, stop before 1Password" $?
+grep -q 'failure detail 4' <<<"$OUT" && grep -q 'failure detail 8' <<<"$OUT" && ! grep -qE 'failure detail [123]$' <<<"$OUT"; assert "Homebrew failure shows exactly its last five log lines" $?
+# C3: public handoff inherits stdin and never redirects a CLI from /dev/tty.
+! grep -q '/dev/tty' "$INSTALL"; assert "installer never redirects the CLI from /dev/tty" $?
 
 echo "---"
 if [ "$FAILURES" -eq 0 ]; then echo "ALL PASS"; else echo "$FAILURES FAILURES"; exit 1; fi
