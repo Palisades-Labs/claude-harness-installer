@@ -1,6 +1,6 @@
 # CLAUDE.md — claude-harness-installer
 
-*Last Edited: 2026-10-02*
+*Last Edited: 2026-10-03*
 
 Maintainer notes. This repo is public: never commit a customer name, a repo name, an
 address or a secret. Everything customer-specific comes from the customer's 1Password
@@ -14,13 +14,15 @@ item "Claude Setup Access" at run time.
   `op account get` once, saves the item's read-only token with the osxkeychain helper for the
   one repo URL, shallow-clones the repo and runs its `setup/setup.sh` with `HARNESS_SRC`.
 - `tests/test_install_dryrun.sh` — stubbed tests (no real installs, 1Password reads or Keychain writes).
-- `v2.sh` — the previous GitHub-sign-in shim. Delete it in its own PR once the customer guides show
-  `install.sh` and that command has run successfully from `main`.
 
 ## Rules
 
 - The token only ever travels through a pipe into `git credential approve` sent to our helper
-  alone (`git -c credential.helper= -c credential.helper=<helper> ...`). Never put it in argv,
+  alone (`git -c credential.helper= -c credential.helper=<helper> ...`). Verify it with
+  `git credential fill` using the same helper, with prompts disabled, before claiming it was
+  saved. Require `username=x-access-token` and a non-empty password; never print the response.
+  If `security show-keychain-info` reports "User interaction is not allowed", explain how to
+  retry in desktop Terminal. Never put the key in argv,
   output or a file. The test fails if it appears anywhere.
 - Before saving the token, the script removes what an earlier run added for the repo (only
   settings carrying its `claudeSetupManaged=true` marker) and asks git itself (`git ls-remote`,
