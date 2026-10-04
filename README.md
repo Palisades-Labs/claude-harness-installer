@@ -22,8 +22,10 @@ The argument is the company's 1Password sign-in address, for example
 5. Reads the item **Claude Setup Access** from the company's 1Password: its `repo`
    field (the private setup repo, `owner/name`) and its `credential` field (a read-only
    access key for that one repo). It saves the key in the Mac's Keychain for that repo
-   only. The key is never shown, never passed as a command argument and never written
-   to a file. Nobody needs a GitHub account.
+   only, and checks that the Keychain returns it before reporting success. If the
+   Keychain is locked or setup is running over remote login, it explains how to retry
+   in Terminal on the Mac. The key is never shown, never passed as a command argument
+   and never written to a file. Nobody needs a GitHub account.
 6. Downloads the private repo to a temporary folder with that key, which also proves
    the access works, and runs its `setup/setup.sh`. That script does the rest and
    prints the final report.
@@ -56,7 +58,5 @@ prints the plan without reading anything from 1Password or changing anything.
 - `install.sh`: the installer.
 - `tests/test_install_dryrun.sh`: tests with every external tool stubbed. Run
   `shellcheck install.sh && bash tests/test_install_dryrun.sh`.
-- `v2.sh`: the previous command, which needed each person to sign in to GitHub. It stays
-  until the setup guides show the new command, then a separate change deletes it.
 
 Questions: aaron@palisadeslabs.ai.

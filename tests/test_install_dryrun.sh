@@ -88,11 +88,30 @@ STUB
   # `reject` removes. `ls-remote` works only with this Mac's own sign-in
   # (STUB_OWN_ACCESS=1) or with our helper configured and the key saved. `clone`
   # creates a checkout whose setup/setup.sh records how it was started.
+  # Always stub security, including the unlocked case: never query the real Keychain.
+  cat > "$STUB/security" <<'STUB'
+#!/usr/bin/env bash
+printf 'security %s\n' "$*" >> "$EVENTS"
+if [ "${STUB_KEYCHAIN_LOCKED:-0}" = 1 ]; then
+  echo 'security: User interaction is not allowed.' >&2
+  exit 1
+fi
+exit 0
+STUB
+
   cat > "$STUB/git" <<'STUB'
 #!/usr/bin/env bash
 printf 'git %s\n' "$*" >> "$EVENTS"
 case " $* " in
   *" config "*) exec /usr/bin/git "$@";;
+  *" credential fill"*)
+    p=""; while IFS= read -r l && [ -n "$l" ]; do case "$l" in path=*) p="${l#path=}";; esac; done
+    printf 'fill path=%s prompts=%s/%s\n' "$p" "$GIT_TERMINAL_PROMPT" "$GCM_INTERACTIVE" >> "$EVENTS"
+    if [ "${STUB_FILL_MODE:-}" = missing ] || { [ "${STUB_FILL_MODE:-}" = bare-missing ] && [[ "$p" != *.git ]]; }; then exit 0; fi
+    [ -e "$STATE/key-saved" ] || exit 1
+    printf 'username=%s\n' "${STUB_FILL_USERNAME:-x-access-token}"
+    if [ "${STUB_FILL_MODE:-}" = empty ]; then printf 'password=\n'; else printf 'password=%s\n' "$FAKE_TOKEN"; fi
+    exit "${STUB_FILL_RC:-0}";;
   *" ls-remote "*)
     [ "${STUB_OWN_ACCESS:-0}" = 1 ] && exit 0
     /usr/bin/git config --global --get-all credential.https://github.com/acme-co/acme-harness.git.helper 2>/dev/null | grep -q . && [ -e "$STATE/key-saved" ] && exit 0
@@ -102,7 +121,8 @@ case "$*" in
   *"credential approve"*)
     p=""; pw=""; while IFS= read -r l && [ -n "$l" ]; do case "$l" in path=*) p="${l#path=}";; password=*) pw="${l#password=}";; esac; done
     touch "$STATE/key-saved"
-    if [ "$pw" = "$FAKE_TOKEN" ]; then echo "approve path=$p key_matches=1" >> "$EVENTS"; else echo "approve path=$p key_matches=0" >> "$EVENTS"; fi;;
+    if [ "$pw" = "$FAKE_TOKEN" ]; then echo "approve path=$p key_matches=1" >> "$EVENTS"; else echo "approve path=$p key_matches=0" >> "$EVENTS"; fi
+    exit "${STUB_APPROVE_RC:-0}";;
   *"credential reject"*)
     p=""; while IFS= read -r l && [ -n "$l" ]; do case "$l" in path=*) p="${l#path=}";; esac; done
     rm -f "$STATE/key-saved"; echo "reject path=$p" >> "$EVENTS";;
@@ -222,6 +242,26 @@ run_case env STUB_OWN_ACCESS=1 bash "$INSTALL" "$ADDR"
 : > "$EVENTS"
 run_case bash "$INSTALL" "$ADDR"
 [ "$RC" = 1 ] && [ "$(ours | tr '\n' ' ')" = "helper=!my-personal-helper " ] && ! grep -qE 'approve|reject path|^git clone' "$EVENTS" && grep -q "has its own git sign-in settings" <<<"$OUT"; assert "test_maintainer_own_helper_failing_untouched: unmarked settings left, no key added, says so, exit 1" $?
+
+# C7: read the key back before claiming success; the save helper can fail silently.
+new_case
+run_case bash "$INSTALL" "$ADDR"
+[ "$RC" = 0 ] && grep -q 'Saved the' <<<"$OUT" && [ "$(grep -c '^fill path=' "$EVENTS")" = 2 ] && ! grep -q '^security ' "$EVENTS"; assert "saved key: verify both repo paths before reporting success" $?
+for p in "acme-co/acme-harness.git" "acme-co/acme-harness"; do
+  grep -q "^fill path=$p prompts=0/never$" "$EVENTS"; assert "key read-back disables prompts for $p" $?
+done
+! grep '^git ' "$EVENTS" | grep 'credential fill' | grep -qv -- '-c credential.helper= -c credential.helper=osxkeychain -c credential.useHttpPath=true'; assert "key read-back uses only the same scoped helper" $?
+! grep -qF -- "$FAKE_TOKEN" <<<"$OUT" && ! grep -rqF -- "$FAKE_TOKEN" "$T"; assert "read-back never exposes the key in output, argv logs or files" $?
+new_case
+run_case env STUB_FILL_MODE=missing STUB_KEYCHAIN_LOCKED=1 bash "$INSTALL" "$ADDR"
+[ "$RC" = 1 ] && grep -qF "Your Mac's Keychain is locked or this isn't a desktop Terminal session. Open Terminal on the Mac itself (not over remote login), unlock if asked, and run the command again." <<<"$OUT" && ! grep -q 'Saved the' <<<"$OUT" && grep -q '^security show-keychain-info$' "$EVENTS" && ! grep -q '^git clone' "$EVENTS"; assert "silent save failure with locked Keychain: desktop Terminal instructions, no success or download" $?
+! grep -qF -- "$FAKE_TOKEN" <<<"$OUT" && ! grep -rqF -- "$FAKE_TOKEN" "$T"; assert "locked Keychain path never exposes the key" $?
+for spec in 'STUB_FILL_MODE=missing' 'STUB_FILL_MODE=empty' 'STUB_FILL_USERNAME=someone-else' 'STUB_FILL_RC=1' 'STUB_FILL_MODE=bare-missing' 'STUB_APPROVE_RC=1'; do
+  new_case
+  run_case env "$spec" bash "$INSTALL" "$ADDR"
+  [ "$RC" = 1 ] && grep -q "Couldn't save and verify" <<<"$OUT" && ! grep -q 'Saved the' <<<"$OUT" && ! grep -q '^git clone' "$EVENTS"; assert "unverified key ($spec): plain failure, no success or download" $?
+  ! grep -qF -- "$FAKE_TOKEN" <<<"$OUT" && ! grep -rqF -- "$FAKE_TOKEN" "$T"; assert "unverified key ($spec): no key exposure" $?
+done
 
 # test_host_username_regression (I3), real git + store helper: a host-wide github.com
 # username must not hide the key saved for x-access-token.

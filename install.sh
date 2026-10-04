@@ -337,8 +337,16 @@ own_github_access() { # <owner/repo>
 }
 
 # Send one credential record to our helper only (never to the person's other helpers).
-credential() { # <approve|reject>; record on stdin
-  git -c credential.helper= -c "credential.helper=$HELPER" -c credential.useHttpPath=true credential "$1"
+credential() { # <approve|reject|fill>; record on stdin
+  GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never git -c credential.interactive=false \
+    -c credential.helper= -c "credential.helper=$HELPER" -c credential.useHttpPath=true credential "$1"
+}
+
+# Check the helper's answer without printing or writing any part of the key.
+saved_key_available() { # <repo path>
+  printf 'protocol=https\nhost=github.com\npath=%s\nusername=x-access-token\n\n' "$1" \
+    | credential fill 2>/dev/null \
+    | awk '/^username=x-access-token$/ { user=1 } /^password=./ { password=1 } END { exit !(user && password) }'
 }
 
 # Our repo-scoped git settings carry this marker key (git ignores unknown keys), so a
@@ -373,7 +381,7 @@ APPROVAL_MSG="The 1Password approval wasn't given in time. Run the command again
 
 # Step 5. Sets REPO.
 save_access_key() {
-  local token url path rc=0 errf
+  local token url path rc=0 errf keychain_info
   if [ "$DRY" = 1 ]; then
     say "[dry-run] read the repo name and access key from the 1Password item \"$ITEM\" and save the key in the Keychain for that repo only"
     return 0
@@ -424,10 +432,19 @@ save_access_key() {
   done
   # printf is a shell builtin: the key reaches git's stdin, never a process argument.
   for path in "$REPO.git" "$REPO"; do
-    printf 'protocol=https\nhost=github.com\npath=%s\nusername=x-access-token\npassword=%s\n\n' "$path" "$token" | credential approve || rc=1
+    printf 'protocol=https\nhost=github.com\npath=%s\nusername=x-access-token\npassword=%s\n\n' "$path" "$token" | credential approve >/dev/null 2>&1 || rc=1
+    saved_key_available "$path" || rc=1
   done
   token=""
-  [ "$rc" = 0 ] || { say "Couldn't save the access key in the Keychain. Run the command again."; return 1; }
+  if [ "$rc" != 0 ]; then
+    keychain_info="$(security show-keychain-info 2>&1)" || :
+    if grep -qF 'User interaction is not allowed' <<<"$keychain_info"; then
+      say "Your Mac's Keychain is locked or this isn't a desktop Terminal session. Open Terminal on the Mac itself (not over remote login), unlock if asked, and run the command again."
+    else
+      say "Couldn't save and verify the access key in the Keychain. Run the command again; if it repeats, tell the person who manages Claude setup for your team."
+    fi
+    return 1
+  fi
   say "Saved the access key in the Keychain (used only for $REPO)."
 }
 
